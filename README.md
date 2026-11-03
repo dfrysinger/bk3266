@@ -1,93 +1,206 @@
-# bk3266
+# BK3266 firmware tools: dump, decode, and change the config of Beken BK3266 Bluetooth chips over UART
 
-An agent skill and a single-file Python CLI for **Beken BK3266** Bluetooth audio chips, the chip inside many cheap
-headphones, sleep headbands, speakers and Bluetooth receivers. With it you can:
+Open-source tools and documentation for the **Beken BK3266** Bluetooth audio SoC, the chip inside many inexpensive
+Bluetooth headphones, sleep headbands, speakers, car kits and audio receivers. With them you can:
 
-- **Back up** the whole SPI flash over a 3.3 V UART, with two passes that must match
-- **Decode** the configuration: battery thresholds, prompt volume, timeouts, reconnect behaviour, sniff/power saving
-- **Extract** the voice prompts as playable audio
-- **Patch** settings offline (CRCs recomputed) and **write them back safely**: dry run by default, pre-image check, only changed sectors, verified readback, original write protection restored
-- **Disassemble** the firmware (it's BA2, not ARM)
-- **Diagnose Bluetooth drops** from an iPhone PacketLogger capture
+- connect to the **BK3266 ROM bootloader** over a 3.3 V USB-serial (FTDI) adapter from macOS, Linux or Windows
+- **download / back up / dump the full SPI flash firmware**, with no Windows-only Beken ToolKit needed
+- **decode and change configuration settings**: voice prompts, low-battery warning, volumes, sleep and power-off
+  timeouts, auto-reconnect, sniff / power saving
+- **mute or replace voice prompts** ("battery low", "connected", "disconnected", "power on", "pairing")
+- **disassemble the firmware**: the BK3266 core is **BA2 (Beyond Architecture 2), not ARM**
+- diagnose **Bluetooth disconnect / reconnect loops** from an iPhone PacketLogger capture
 
-It works with **Claude Code, Codex CLI and GitHub Copilot CLI**. The skill teaches the agent the protocol, the safety rules
-and how to walk a non-specialist through pressing the button at the right moment.
+The project is a single Python script (`bk3266.py`) plus an **agent skill** for Claude Code, OpenAI Codex CLI and GitHub
+Copilot CLI. The skill teaches an AI coding agent the protocol and the safety rules.
 
-> **Status:** reads, config decoding and a config write (muting the low-battery prompt) are verified on real hardware
-> (512 KiB Puya flash, 2021 firmware). Other flash sizes or firmware builds may need `--config-base`. Read the field
-> confidence notes before writing anything.
+> **Status:** reading flash, decoding the config and writing a config change are verified on real hardware (BK3266, 512 KiB
+> Puya flash, firmware built 2021). Other flash sizes or firmware builds may need `--config-base`. Check the
+> [field confidence notes](skills/bk3266/references/config-map.md) before writing.
 
-## Install
+---
+
+## 1. How to connect to a BK3266 (wiring)
+
+| BK3266 board | USB-serial adapter (3.3 V) |
+|---|---|
+| UART **TX** pad | adapter **RX** |
+| UART **RX** pad | adapter **TX** (330 Ω–1 kΩ series resistor recommended) |
+| GND (battery −) | GND |
+| — | **VCC: leave disconnected.** Power the board from its own battery. |
+
+- **Use a 3.3 V adapter. 5 V logic can damage the chip.**
+- Many BK3266 boards expose UART as **two small unlabeled round test pads next to the chip**. If nothing answers, swap TX and RX.
+- **Shipping firmware prints nothing on UART.** A silent line doesn't mean the wiring is wrong.
+- Serial settings: **115200 baud, 8N1**.
+
+More: [hardware.md](skills/bk3266/references/hardware.md).
+
+## 2. How to enter the BK3266 bootloader (download mode)
+
+The ROM bootloader listens only briefly at power-on:
+
+1. The host continuously sends **LinkCheck** `01 E0 FC 01 00`.
+2. **Press and hold the power button.** The chip replies `04 0E 05 01 E0 FC 01 00`.
+3. **Immediately send the second handshake** `01 E0 FC 02 AA 55`. The reply is `04 0E 05 01 E0 FC AA 55`.
+4. The session is now stable and the button can be released.
+
+> **Why "BK3266 bootloader exits after one read" happens:** without step 3, the bootloader serves a single 4 KB
+> read and returns to the application about 0.5 s later. The official Beken ToolKit (V5.8.6) sends this AA/55
+> handshake; earlier open-source scripts didn't.
+
+```sh
+pip install pyserial
+python3 skills/bk3266/scripts/bk3266.py ping --port /dev/cu.usbserial-XXXX --say   # Linux: /dev/ttyUSB0, Windows: COM5
+```
+`ping` prints the flash JEDEC ID, the capacity, and the flash write-protection status.
+
+## 3. How to download (dump) the BK3266 firmware
+
+```sh
+python3 skills/bk3266/scripts/bk3266.py dump --port /dev/cu.usbserial-XXXX --say --out backups
+```
+This reads the whole flash **twice** and checks that both reads match byte for byte. It saves `flash-dump-1.bin` and
+`flash-dump-2.bin`, a `manifest.json` with SHA-256 hashes, and a full TX/RX log. A 512 KiB part takes about a minute per pass at 115200.
+
+### BK3266 bootloader command reference
+
+Extended frame: `01 E0 FC FF F4 <len:u16 LE> <cmd> <args…>`. Reply: `04 0E FF 01 E0 FC F4 <len:u16 LE> <cmd> <status> <payload…>`. Status `00` = OK.
+
+| Cmd | Operation | Args | Reply payload |
+|---|---|---|---|
+| `09` | **Read 4 KiB** | `addr:u32 LE` | `addr` + 4096 bytes |
+| `0B` | **Erase 4 KiB sector** | `addr:u32 LE` | `addr` |
+| `07` | **Write 4 KiB sector** | `addr:u32 LE` + 4096 bytes | `addr` |
+| `0C` | Read flash status register | `05` (SR1) / `35` (SR2) | `reg, value` |
+| `0D` | Write flash status registers | `01 SR1 SR2` | echo |
+| `0E` | SPI passthrough (e.g. JEDEC `9F 00 00 00`) | 4 bytes | 4 bytes, first one a dummy byte |
+
+Example: a full read of block 0 is `01 E0 FC FF F4 05 00 09 00 00 00 00`.
+
+**Write protection:** the Puya flash seen ships with SR1/SR2 = `00 40` (whole array protected). Write `00 00` before
+erasing or programming, then **restore the original value**. Reads work while the flash is protected.
+Full protocol notes, with the ToolKit addresses each command was found at: [protocol.md](skills/bk3266/references/protocol.md).
+
+## 4. BK3266 flash format (CRC every 32 bytes)
+
+The firmware image is stored as **34-byte records: 32 data bytes followed by a CRC16**. The CRC uses poly `0x8005`, init `0xFFFF`,
+no reflection and no final XOR, and is stored big-endian (`0x8029` = CRC of 32 zero bytes). Address conversion:
+`raw = (logical // 32) * 34 + logical % 32`.
+**Any edit must recompute the CRC of each record it touches.** `bk3266.py patch` does this for you.
+
+| Region (512 KiB part) | Raw offset | Logical |
+|---|---|---|
+| Program code (BA2) | `0x00000`… | `0x00000`… |
+| Voice prompts (SBC audio) | … | `0x5DE00`… |
+| **Configuration** | **`0x7C500`** | **`0x75000`** |
+| Per-device environment / pairing record | `0x7F000` | not CRC-paged; **preserve** |
+
+More: [flash-format.md](skills/bk3266/references/flash-format.md).
+
+## 5. How to read and change BK3266 configuration settings
+
+```sh
+S=skills/bk3266/scripts/bk3266.py
+python3 $S config backups/dump-*/flash-dump-1.bin                 # decode every known setting + prompt table
+python3 $S patch  backups/dump-*/flash-dump-1.bin -o new.bin \
+        --mute-prompt low-battery --set vol_wave=6                # offline: CRCs fixed, byte diff printed
+python3 $S write new.bin --expect backups/dump-*/flash-dump-1.bin --port /dev/cu.usbserial-XXXX          # dry run
+python3 $S write new.bin --expect backups/dump-*/flash-dump-1.bin --port /dev/cu.usbserial-XXXX --yes    # write
+```
+
+`write` safety:
+- Before writing, it **re-reads the whole chip and aborts unless it matches `--expect`**.
+- It erases and writes **only the 4 KiB sectors that changed**, verifies each one twice, restores the original write protection, then re-reads the full image to confirm.
+- It refuses sectors outside the config region unless you pass `--allow-any-sector`.
+
+### Common BK3266 settings (offset from config base)
+
+| Setting | Offset | Type | Meaning |
+|---|---:|---|---|
+| `vol_a2dp` / `vol_hfp` / `vol_wave` | `0x09` / `0x0A` / `0x0B` | u8 | default music / call / **voice-prompt volume** |
+| `lp_interval` | `0x0E` | u32 | battery check interval, 10 ms ticks (6000 = 60 s) |
+| `lp_threshold` | `0x12` | u16 | **low-battery warning** threshold (≈ mV, e.g. 3300) |
+| `lp_pd_threshold` | `0x14` | u16 | low-voltage **shutdown** threshold (≈ mV, e.g. 3100) |
+| `sleep_timeout` | `0x22` | u16 | idle time before sniff / low power, 10 ms ticks. **Never 0: that fires immediately** |
+| `powerdown_timeout` | `0x24` | i32 | auto power-off when not connected, 10 ms ticks |
+| `bt_flag` | `0x59` | u32 | `0x10` auto-reconnect, `0x20` link-loss recovery |
+| `disconn_retry_count` / `disconn_retry_interval` | `0x99` / `0x9A` | i8 / u32 ms | reconnect attempts (-1 = unlimited) / interval |
+| `auto_conn_interval` | `0x9F` | u16 ms | auto-reconnect interval |
+| `wave_lang_sel` | `0xE5` | u8 | voice-prompt language bank |
+| `wave_info[42]` | `0x424` | 3 B each | voice prompt table: `type, page:u16`; **type 0 = muted** |
+| `feature_flag` | `0x34A` | u32 | bit `0x80000` = **sniff (Bluetooth power saving)** on 2021 firmware |
+
+Full map with confidence levels: [config-map.md](skills/bk3266/references/config-map.md).
+
+### Recipes
+
+| I want to… | Command |
+|---|---|
+| **Disable the "battery low" voice prompt** | `patch --mute-prompt low-battery` |
+| Mute the connected / disconnected announcements | `patch --mute-prompt connected --mute-prompt disconnected` |
+| Make all voice prompts quieter | `patch --set vol_wave=5` |
+| Stop it disconnecting ~30 s after audio stops (sniff) | `patch --clear-bits feature_flag=0x80000` (see [disconnects.md](skills/bk3266/references/disconnects.md)) |
+| Lengthen the idle timer instead | `patch --set sleep_timeout=12000` (120 s) |
+| Extract the voice prompts as WAV | `prompts dump.bin -o voice-prompts` (needs ffmpeg) |
+
+## 6. Disassembling BK3266 firmware (BA2, not ARM)
+
+```sh
+python3 $S strip dump.bin -o logical.bin        # drop CRC bytes
+python3 $S disasm logical.bin -o listing.asm    # fetches alephsecurity/pyba2 on first use
+python3 $S info dump.bin --strings              # debug strings: the best map of the code
+```
+Ghidra has no stock BA2 module. Navigate by the firmware's debug strings and by HCI opcode immediates.
+More: [reverse-engineering.md](skills/bk3266/references/reverse-engineering.md).
+
+## 7. Why do BK3266 headphones disconnect and reconnect when audio stops?
+
+The typical cause is the idle timer (`sleep_timeout`, often 30 s). When it expires, the firmware puts the link into Bluetooth **sniff
+mode**. If sniff negotiation or low-power timing fails, the link drops, and auto-reconnect turns that into a
+"disconnected… connected…" loop. To see which side failed, capture the HCI disconnect reason with iPhone PacketLogger or the
+Android HCI snoop log, then:
+
+```sh
+python3 $S pklg capture.pklg     # sniff requests, mode changes, remote firmware version, disconnect reason codes
+```
+Step-by-step capture guide and experiments: [disconnects.md](skills/bk3266/references/disconnects.md).
+
+---
+
+## Install as an AI agent skill
 
 ### Claude Code
 ```sh
 claude plugin marketplace add dfrysinger/bk3266 --scope user
 claude plugin install --scope user bk3266@bk3266
 ```
-
-### Codex CLI
+### OpenAI Codex CLI
 ```sh
 codex plugin marketplace add dfrysinger/bk3266
 codex plugin add bk3266@bk3266
 ```
-
 ### GitHub Copilot CLI
 ```sh
 copilot plugin install dfrysinger/bk3266
 ```
-
-### Just the CLI
-```sh
-pip install pyserial
-python3 skills/bk3266/scripts/bk3266.py -h
-```
-
-## Quick start
-
-Wire a **3.3 V** USB-UART to the chip's TX/RX pads and ground, leaving VCC disconnected (see [hardware](skills/bk3266/references/hardware.md)). Then:
-
-```sh
-S=skills/bk3266/scripts/bk3266.py
-python3 $S ping --port /dev/cu.usbserial-XXXX --say      # press and hold power when told
-python3 $S dump --port /dev/cu.usbserial-XXXX --say --out backups
-python3 $S config backups/dump-*/flash-dump-1.bin
-python3 $S patch backups/dump-*/flash-dump-1.bin -o muted.bin --mute-prompt low-battery
-python3 $S write muted.bin --expect backups/dump-*/flash-dump-1.bin --port /dev/cu.usbserial-XXXX        # dry run
-python3 $S write muted.bin --expect backups/dump-*/flash-dump-1.bin --port /dev/cu.usbserial-XXXX --yes  # for real
-```
-
-## The key protocol discovery
-
-The ROM bootloader answers LinkCheck `01 E0 FC 01 00` during power-on, but it **drops back to the application after
-one read unless you also send `01 E0 FC 02 AA 55`** (reply `04 0E 05 01 E0 FC AA 55`). The official Beken ToolKit
-sends this second handshake. Earlier open scripts didn't. Full command table: [protocol.md](skills/bk3266/references/protocol.md).
-
-## Documentation
-
-| Topic | File |
-|---|---|
-| Agent workflow and safety rules | [SKILL.md](skills/bk3266/SKILL.md) |
-| UART bootloader protocol | [protocol.md](skills/bk3266/references/protocol.md) |
-| Flash layout, CRC records, voice prompts | [flash-format.md](skills/bk3266/references/flash-format.md) |
-| Config field map with confidence | [config-map.md](skills/bk3266/references/config-map.md) |
-| Disassembly and navigating the code | [reverse-engineering.md](skills/bk3266/references/reverse-engineering.md) |
-| Why it disconnects when audio stops | [disconnects.md](skills/bk3266/references/disconnects.md) |
-| Wiring and finding pads | [hardware.md](skills/bk3266/references/hardware.md) |
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -s tests
 ```
-The tests are offline. They include a simulated bootloader that exercises `dump` and `write` end to end.
+The tests run offline, using a simulated BK3266 bootloader that exercises `dump` and `write` end to end.
 
-## What's not here
+## What's not included
 
-No firmware images, voice clips or Beken ToolKit binaries. They belong to their vendors, and dumps contain
-per-device pairing data. `.gitignore` blocks `*.bin`. The [pyba2](https://github.com/alephsecurity/pyba2) BA2 decoder is
-fetched on first use.
+There are no firmware images, voice clips or Beken ToolKit binaries in this repo. They belong to their vendors, and
+dumps contain per-device pairing data (`.gitignore` blocks `*.bin`). The BA2 decoder
+[pyba2](https://github.com/alephsecurity/pyba2) is fetched on first use.
+
+Related: the [BK3254 project](https://github.com/tomaskovacik/BK3254), where the ToolKit was shared (issue #20).
 
 ## Disclaimer
 
 Flashing can brick a device. Practice on a spare board, keep two matching backups, and only write sectors you
-understand. This project isn't affiliated with Beken. Provided as-is under the MIT license.
+understand. This project isn't affiliated with Beken Corporation. MIT license.
