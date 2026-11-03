@@ -1,0 +1,20 @@
+{
+  "name": "bk3266",
+  "interface": {
+    "displayName": "BK3266 flash tools"
+  },
+  "plugins": [
+    {
+      "name": "bk3266",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

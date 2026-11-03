@@ -1,0 +1,9 @@
+# Never commit device images or evidence: they contain vendor firmware and per-device pairing data.
+*.bin
+*.pklg
+*.sbc
+*.wav
+bk3266-evidence/
+backups/
+__pycache__/
+.DS_Store

@@ -1,0 +1,75 @@
+---
+name: bk3266
+description: Read, back up, decode, patch and write the SPI flash of Beken BK3266 Bluetooth audio chips (headphones, speakers, sleep headbands, cheap receivers) over a 3.3 V UART, and diagnose their Bluetooth behaviour. Use when someone wants to dump or back up BK3266 firmware, change its configuration (voice prompts, low-battery warnings, volumes, timeouts, reconnect behaviour, sniff/power saving), mute or replace voice prompts, disassemble the BA2 code, or work out why a BK3266 device disconnects, plus when they mention Beken, BK3266, BK3254-family ToolKit, or `01 E0 FC` bootloader frames.
+---
+
+# BK3266 flash and firmware
+
+Everything goes through one CLI: `scripts/bk3266.py` (Python 3.9+, `pip install pyserial` for device commands).
+Run `python3 scripts/bk3266.py <command> -h` for options. Device commands write an evidence directory
+with a full TX/RX log and `manifest.json`; keep those.
+
+## Safety rules (non-negotiable)
+
+1. **No write without two identical full backups** (`dump` does this) **and the owner's explicit approval of the exact byte diff.**
+2. **Practice board first** when the owner has a spare; never the only unit.
+3. **Change data, not code.** `write` refuses sectors outside the config region unless `--allow-any-sector`.
+4. **`write` always starts as a dry run.** It re-reads the whole chip and aborts unless it equals `--expect`, writes only changed 4 KiB sectors, verifies each twice, restores the flash's original protection bits, and re-reads everything.
+5. Never set a timer to 0 to "disable" it until the firmware's comparison has been read. `sleep_timeout=0` fires immediately (the CLI refuses it).
+6. Separate **verified** (read back, traced in code) from **inferred** (field names from the 2018 ToolKit) when reporting to the owner.
+
+## Working with the owner
+
+The person holding the board usually isn't a firmware specialist and has to press a button at the right moment.
+Give one physical action at a time, say exactly when to press and release, and use `--say` on macOS for spoken cues.
+The bootloader catch waits up to 5 minutes (`--wait`), so nobody needs to rush.
+
+## Hardware hookup
+
+3.3 V USB-UART (FTDI or similar): adapter RX → chip TX, adapter TX → chip RX, GND → board ground. **Don't connect adapter VCC**; power the board from its own battery.
+A 330 Ω–1 kΩ series resistor on adapter TX is cheap insurance. Many boards expose two unlabeled round test pads
+beside the chip; finding which is TX/RX is covered in [references/hardware.md](references/hardware.md).
+Production firmware is normally silent on UART, so silence doesn't mean the wiring is wrong.
+
+## Core workflow
+
+```sh
+S=scripts/bk3266.py
+python3 $S ping  --port /dev/cu.usbserial-XXXX --say          # catch bootloader; JEDEC ID + protection status
+python3 $S dump  --port /dev/cu.usbserial-XXXX --say --out backups   # two full reads, must match
+python3 $S info  backups/dump-*/flash-dump-1.bin --strings     # CRC extent, config location, debug strings
+python3 $S config backups/dump-*/flash-dump-1.bin              # every known setting + prompt table
+python3 $S patch  original.bin -o candidate.bin --mute-prompt low-battery   # offline, CRCs fixed, prints diff
+python3 $S write candidate.bin --expect original.bin --port ...            # dry run: shows sectors and bytes
+python3 $S write candidate.bin --expect original.bin --port ... --yes      # after owner approves the diff
+```
+
+To catch the bootloader, the host spams LinkCheck while the owner **presses and holds power**. Then it sends the **second
+handshake `01 E0 FC 02 AA 55`**. Without that handshake the bootloader quits ~0.5 s after the first read, which is the classic
+"I can only ever read one block" failure. Protocol details: [references/protocol.md](references/protocol.md).
+
+## Common goals → what to change
+
+| Goal | Change | Notes |
+|---|---|---|
+| Silence one prompt (e.g. low battery) | `--mute-prompt low-battery` | Sets that slot's type byte to 0; player rejects unused slots. Shutdown voltage logic untouched. |
+| All prompts quieter | `--set vol_wave=N` | Global; index, not dB. |
+| Different / clearer voice | Replace SBC clips | `prompts` extracts them. Only bank 0 is usually populated, so switching language rarely helps. See [references/flash-format.md](references/flash-format.md). |
+| Low-battery threshold/interval | `lp_threshold`, `lp_pd_threshold`, `lp_interval` | Muting is usually the better fix. |
+| Drops ~N s after audio stops | See [references/disconnects.md](references/disconnects.md) | Usually idle → sniff. Capture the HCI disconnect reason first. |
+| Reconnect loop behaviour | `disconn_retry_*`, `auto_conn_*`, `bt_flag` | Changes the aftermath, not the cause. |
+
+Field meanings, offsets, units and confidence: [references/config-map.md](references/config-map.md).
+The config base is known for 512 KiB flash (logical `0x75000`). For other sizes, find it (`used`=1 and the device name
+inside the structure) and pass `--config-base`.
+
+## Making the code legible
+
+The CPU is **BA2 (Beyond Architecture 2), not ARM**. Ghidra has no stock BA2 support. Use `strip` to drop the CRC bytes,
+then `disasm` (fetches [pyba2](https://github.com/alephsecurity/pyba2) at a pinned commit), and navigate by debug strings
+(`info --strings`). Method and landmarks: [references/reverse-engineering.md](references/reverse-engineering.md).
+
+## Diagnosing Bluetooth drops
+
+`pklg` summarizes an Apple PacketLogger / iOS sysdiagnose capture: sniff requests, mode changes, and
+**Disconnection Complete reason codes**. iPhone and Android capture steps are in [references/disconnects.md](references/disconnects.md).
