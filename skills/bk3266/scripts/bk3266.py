@@ -687,6 +687,15 @@ def cmd_pklg(a):
                 h = int.from_bytes(p[1:3], 'little') & 0xFFF
                 print(f'{stamp}  EVT  ** Disconnection Complete ** handle {h:#x} {handles.get(h, "")} '
                       f'reason {p[3]:#04x} {HCI_REASONS.get(p[3], "")}')
+            elif code == 0x0C and len(p) >= 8 and p[0] == 0:  # Read Remote Version Information Complete
+                h = int.from_bytes(p[1:3], 'little') & 0xFFF
+                mfr, subver = struct.unpack('<HH', p[4:8])
+                print(f'{stamp}  EVT  Remote Version handle {h:#x} {handles.get(h, "")} LMP {p[3]:#04x} '
+                      f'manufacturer {mfr:#06x} subversion {subver:#06x}')
+            elif code == 0x07 and len(p) >= 7 and p[0] == 0:  # Remote Name Request Complete
+                name = p[7:].split(b'\x00', 1)[0].decode(errors='replace')
+                addr = ':'.join(f'{b:02x}' for b in reversed(p[1:7]))
+                print(f'{stamp}  EVT  Remote Name {addr} {name!r}')
             elif code == 0x14 and len(p) >= 6:
                 h = int.from_bytes(p[1:3], 'little') & 0xFFF
                 iv = int.from_bytes(p[4:6], 'little')

@@ -227,11 +227,13 @@ class PklgTests(unittest.TestCase):
         def rec(kind, data, t=0x6000000000000000):
             body = t.to_bytes(8, 'big') + bytes([kind]) + data
             return len(body).to_bytes(4, 'big') + body
-        blob = (rec(0x01, bytes.fromhex('14 06 00 0b 00 02 00 02'))      # mode change -> sniff, 512 slots
+        blob = (rec(0x01, bytes.fromhex('0c 08 00 0b 00 06 5d 00 21 43'))  # remote version
+                + rec(0x01, bytes.fromhex('14 06 00 0b 00 02 00 02'))    # mode change -> sniff, 512 slots
                 + rec(0x01, bytes.fromhex('05 04 00 0b 00 08')))          # disconnect, reason 0x08
         path = Path(tempfile.mkdtemp()) / 'c.pklg'
         path.write_bytes(blob)
         out = run(['pklg', str(path)])
+        self.assertIn('manufacturer 0x005d subversion 0x4321', out)
         self.assertIn('sniff interval 320ms', out)
         self.assertIn('reason 0x08 Connection (Supervision) Timeout', out)
 
