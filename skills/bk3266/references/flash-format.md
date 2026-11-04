@@ -31,6 +31,7 @@ Records straddle sector boundaries, so preserve every other byte of the sector e
 | … | `0x5DE00`… | Prompt SBC clips (located through `wave_info` page pointers) |
 | `0x7C500` | `0x75000` | **Main configuration** (`0x77F` bytes, `used` = 1, includes device name) |
 | ~`0x7CFE4` | | End of the CRC-valid run |
+| `0x7E000` | — | Paired-device / link-key log, not CRC-paged. Loaded into RAM at boot (`0x392DD`; `0xFE000` on 1 MiB parts). **The firmware appends to it whenever it runs**, so re-dump before every write. |
 | `0x7F000` | — | Environment record (`BK326601`), not CRC-paged. **Preserve it.** It holds pairing and calibration data. |
 
 `bk3266.py info` reports the CRC-valid extent of any dump.

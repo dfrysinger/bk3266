@@ -36,6 +36,33 @@ turns policy bit `0x4` on and starts the headset's own sniff entry. Every unansw
 window. That's consistent with a collision between phone- and headset-initiated sniff. With the bit cleared, the policy stays
 "refuse", and refusal is proven to work (the `0x24` above). That makes `--clear-bits feature_flag=0x80000` the first fix to try.
 
+### Fix confirmed: clear `feature_flag` bit `0x80000` (same board, same phone, 2026-11-03)
+
+A 3-byte write: config `+0x34A` `0x001810C7` → `0x001010C7`, raw `0x7C880` `18`→`10`, plus that record's CRC. The capture afterwards:
+
+```
+11:50:32  CMD  Sniff Mode handle 0x15 max 240ms min 240ms attempt 1 timeout 1
+11:50:32  EVT  Mode Change handle 0x15 -> active status 0x24      ← refused in 12 ms
+          (20 minutes idle: no further sniff requests, no headset-initiated sniff, no disconnects)
+12:10:42  EVT  Disconnection Complete reason 0x13                 ← owner powered the headset off
+```
+
+After one clean refusal, iOS stops asking and keeps the link active. The cost is idle current while connected and silent.
+During A2DP streaming the firmware refuses sniff anyway, so all-night audio is unaffected. A multi-night battery
+comparison is still pending.
+
+**Why not "phone-initiated sniff only"?** It's possible with a code patch: at `0x2B1B4` change `ori r6,r6,0x1` to `0x5` so the
+connection policy allows sniff, and clear the feature bit so the headset never initiates it. That's a code-sector write, and
+it only helps if the failure needs both sides to initiate sniff together. It's untested.
+
+### Capture hygiene
+
+- Start the PacketLogger trace **before** turning the headset on, so the `Connection Complete` (address, LMP version) is in the trace.
+- An Apple Watch paired to the same phone generates hundreds of thousands of L2CAP packets plus its own sniff and disconnect events.
+  Its address will show up in `pklg` output (manufacturer `0x004C`). Ignore it, or filter by the headset's handle.
+- PacketLogger autosaves the live trace to `~/<date> <time>.pklg`. macOS puts a narrow no-break space before "PM" in the
+  name, so copy it with `find ~ -maxdepth 1 -name '*.pklg'` rather than typing the name.
+
 ## Step 1: capture the HCI disconnect reason (no firmware change)
 
 ### iPhone
@@ -73,7 +100,7 @@ This prints sniff requests, Mode Change events (active ↔ sniff, with interval)
 | Experiment | Patch | What it tells you |
 |---|---|---|
 | Move the timer | `--set sleep_timeout=12000` (120 s) | If the first drop moves to ~2 min, the idle path is confirmed as the trigger. |
-| Disable sniff | `--clear-bits feature_flag=0x80000` | Likely real fix. Costs some idle battery. On 2021 firmware use `feature_flag`, **not** the ToolKit's `system_flag` checkbox. |
+| Disable sniff | `--clear-bits feature_flag=0x80000` | **Confirmed fix** (see above). Costs some idle battery. On 2021 firmware use `feature_flag`, **not** the ToolKit's `system_flag` checkbox. |
 | Tame the loop | `disconn_retry_*`, `auto_conn_*` | Changes the aftermath only. |
 
 Don't set `sleep_timeout` to 0 or `0xFFFF` expecting "disabled". 0 fires immediately, and `0xFFFF` is just ~11 min.

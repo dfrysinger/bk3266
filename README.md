@@ -14,8 +14,8 @@ Bluetooth headphones, sleep headbands, speakers, car kits and audio receivers. W
 The project is a single Python script (`bk3266.py`) plus an **agent skill** for Claude Code, OpenAI Codex CLI and GitHub
 Copilot CLI. The skill teaches an AI coding agent the protocol and the safety rules.
 
-> **Status:** reading flash, decoding the config and writing a config change are verified on real hardware (BK3266, 512 KiB
-> Puya flash, firmware built 2021). Other flash sizes or firmware builds may need `--config-base`. Check the
+> **Status:** reading flash, decoding the config, writing a config change, rebooting out of download mode and the
+> disconnect-loop fix are all verified on real hardware (BK3266, 512 KiB Puya flash, firmware built 2021). Other flash sizes or firmware builds may need `--config-base`. Check the
 > [field confidence notes](skills/bk3266/references/config-map.md) before writing.
 
 ---
@@ -107,6 +107,7 @@ no reflection and no final XOR, and is stored big-endian (`0x8029` = CRC of 32 z
 | Program code (BA2) | `0x00000`… | `0x00000`… |
 | Voice prompts (SBC audio) | … | `0x5DE00`… |
 | **Configuration** | **`0x7C500`** | **`0x75000`** |
+| Paired-device log (rewritten by the firmware whenever it runs) | `0x7E000` | not CRC-paged |
 | Per-device environment / pairing record | `0x7F000` | not CRC-paged; **preserve** |
 
 More: [flash-format.md](skills/bk3266/references/flash-format.md).
@@ -126,6 +127,10 @@ python3 $S write new.bin --expect backups/dump-*/flash-dump-1.bin --port /dev/cu
 - Before writing, it **re-reads the whole chip and aborts unless it matches `--expect`**.
 - It erases and writes **only the 4 KiB sectors that changed**, verifies each one twice, restores the original write protection, then re-reads the full image to confirm.
 - It refuses sectors outside the config region unless you pass `--allow-any-sector`.
+- It reboots the chip out of download mode when it's done.
+
+**Use a fresh backup.** The firmware appends to its paired-device log every time the headset runs, so a backup from
+yesterday won't match, and `write` will (correctly) refuse. Run `dump --no-reboot` right before `patch` and `write`.
 
 ### Common BK3266 settings (offset from config base)
 
@@ -153,7 +158,7 @@ Full map with confidence levels: [config-map.md](skills/bk3266/references/config
 | **Disable the "battery low" voice prompt** | `patch --mute-prompt low-battery` |
 | Mute the connected / disconnected announcements | `patch --mute-prompt connected --mute-prompt disconnected` |
 | Make all voice prompts quieter | `patch --set vol_wave=5` |
-| Stop it disconnecting ~30 s after audio stops (sniff) | `patch --clear-bits feature_flag=0x80000` (see [disconnects.md](skills/bk3266/references/disconnects.md)) |
+| **Stop it disconnecting ~30 s after audio stops** (confirmed fix) | `patch --clear-bits feature_flag=0x80000` (see [§7](#7-why-do-bk3266-headphones-disconnect-and-reconnect-when-audio-stops)) |
 | Lengthen the idle timer instead | `patch --set sleep_timeout=12000` (120 s) |
 | Extract the voice prompts as WAV | `prompts dump.bin -o voice-prompts` (needs ffmpeg) |
 
@@ -169,9 +174,21 @@ More: [reverse-engineering.md](skills/bk3266/references/reverse-engineering.md).
 
 ## 7. Why do BK3266 headphones disconnect and reconnect when audio stops?
 
-The typical cause is the idle timer (`sleep_timeout`, often 30 s). When it expires, the firmware puts the link into Bluetooth **sniff
-mode**. If sniff negotiation or low-power timing fails, the link drops, and auto-reconnect turns that into a
-"disconnected… connected…" loop. To see which side failed, capture the HCI disconnect reason with iPhone PacketLogger or the
+**Diagnosed and fixed on real hardware (iPhone and a BK3266 sleep headband):**
+
+- **Cause:** about 30 s after audio stops, the firmware's idle timer (`sleep_timeout`) allows Bluetooth **sniff mode** and also
+  requests it. The iPhone asks for sniff too, and the headset **never answers the phone's request**. Exactly 30 s later the phone
+  drops the link with HCI reason **`0x22` LMP Response Timeout**. Auto-reconnect turns that into a "disconnected… connected…" loop.
+- **Fix:** clear one config bit, `feature_flag` `0x80000`. The headset then refuses sniff straight away (`status 0x24`),
+  iOS stops asking, and the link stays up. In testing: 20 minutes idle, zero drops.
+  ```sh
+  python3 $S dump  --port /dev/cu.usbserial-XXXX --no-reboot --out backups      # fresh baseline, stay in download mode
+  python3 $S patch backups/dump-*/flash-dump-1.bin -o fixed.bin --clear-bits feature_flag=0x80000
+  python3 $S write fixed.bin --expect backups/dump-*/flash-dump-1.bin --port /dev/cu.usbserial-XXXX --yes
+  ```
+  This is 3 bytes in the config sector. The trade-off is somewhat higher idle current while connected but silent. Streaming is unaffected.
+
+To check whether your device has the same failure, capture the HCI disconnect reason with iPhone PacketLogger or the
 Android HCI snoop log, then:
 
 ```sh

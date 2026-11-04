@@ -65,7 +65,7 @@ handshake `01 E0 FC 02 AA 55`**. Without that handshake the bootloader quits ~0.
 | All prompts quieter | `--set vol_wave=N` | Global; index, not dB. |
 | Different / clearer voice | Replace SBC clips | `prompts` extracts them. Only bank 0 is usually populated, so switching language rarely helps. See [references/flash-format.md](references/flash-format.md). |
 | Low-battery threshold/interval | `lp_threshold`, `lp_pd_threshold`, `lp_interval` | Muting is usually the better fix. |
-| Drops ~N s after audio stops | See [references/disconnects.md](references/disconnects.md) | Usually idle → sniff. Capture the HCI disconnect reason first. |
+| Drops ~30 s after audio stops, reason `0x22` | `--clear-bits feature_flag=0x80000` | **Confirmed fix** on 2021 firmware with an iPhone. The headset refuses sniff instead of ignoring the request. See [references/disconnects.md](references/disconnects.md). |
 | Reconnect loop behaviour | `disconn_retry_*`, `auto_conn_*`, `bt_flag` | Changes the aftermath, not the cause. |
 
 Field meanings, offsets, units and confidence: [references/config-map.md](references/config-map.md).

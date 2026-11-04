@@ -31,7 +31,7 @@ Confidence: **V** = verified in firmware code or by a hardware write; **T** = fr
 | `action_disconn` | `0x0A4` | u8 | 0 = wait for pairing, 1 = auto reconnect | T |
 | `wave_lang_sel` | `0x0E5` | u8 | prompt bank | T |
 | `wave_info[42]` ×5 banks | `0x424` | 3 B each | `type, page:u16`. Bank stride `0x7E` | V (mute written and verified) |
-| `sw_features.feature_flag` | `0x34A` | u32 | **bit `0x80000` gates the sniff path in 2021 firmware** (RAM `r2+0x7C3C`, config RAM base `r2+0x78F2`) | V (code), fix untested |
+| `sw_features.feature_flag` | `0x34A` | u32 | **bit `0x80000` gates the sniff path in 2021 firmware** (RAM `r2+0x7C3C`, config RAM base `r2+0x78F2`) | V (code + hardware): clearing it stops the 0x22 disconnect loop |
 
 Example values from one device (a "Cozy" sleep headband, 2021 firmware): warning 3300, shutdown 3100,
 `lp_interval` 6000, `sleep_timeout` 3000 (30 s), `disconn_retry_interval` 6000, `disconn_retry_count` -1,
