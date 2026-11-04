@@ -57,9 +57,16 @@ it only helps if the failure needs both sides to initiate sniff together. It's u
 
 ### Capture hygiene
 
-- Start the PacketLogger trace **before** turning the headset on, so the `Connection Complete` (address, LMP version) is in the trace.
-- An Apple Watch paired to the same phone generates hundreds of thousands of L2CAP packets plus its own sniff and disconnect events.
-  Its address will show up in `pklg` output (manufacturer `0x004C`). Ignore it, or filter by the headset's handle.
+- **A phone capture contains every Bluetooth device the phone talks to**: watch, earbuds, car, keyboard, Mac. Their sniff
+  switches and disconnects look just like the bug. Identify the headset first, then filter:
+  1. `pklg capture.pklg` ends with a **Devices seen** table: address, LMP version, manufacturer, connection count and disconnect
+     reasons. BK3266 parts report LMP `0x09`, manufacturer `0x000E` (Ceva baseband IP). Apple devices report `0x004C`.
+  2. `pklg capture.pklg --device <headset address>` shows only that device's events, across reconnects (the handle number changes each time).
+  3. If the headset connected before the trace started, its address isn't in the trace. The summary lists such links by
+     handle; use `--handle 0x15`.
+- Start the PacketLogger trace **before** turning the headset on, so its `Connection Complete` (address, version) is captured.
+- Example: on an iPhone, a paired Apple Watch produced hundreds of thousands of packets and 25 disconnect/reconnect cycles
+  during a 20-minute capture, all unrelated to the headset.
 - PacketLogger autosaves the live trace to `~/<date> <time>.pklg`. macOS puts a narrow no-break space before "PM" in the
   name, so copy it with `find ~ -maxdepth 1 -name '*.pklg'` rather than typing the name.
 

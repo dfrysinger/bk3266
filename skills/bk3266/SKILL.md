@@ -82,3 +82,6 @@ then `disasm` (fetches [pyba2](https://github.com/alephsecurity/pyba2) at a pinn
 
 `pklg` summarizes an Apple PacketLogger / iOS sysdiagnose capture: sniff requests, mode changes, and
 **Disconnection Complete reason codes**. iPhone and Android capture steps are in [references/disconnects.md](references/disconnects.md).
+**Phone captures include every device the phone talks to.** Read the closing "Devices seen" table, find the headset
+(BK3266: LMP `0x09`, manufacturer `0x000E`), then re-run with `--device ADDR`, or `--handle H` for a link that was up before the
+trace started. Don't diagnose from another device's drops; on iPhones, a paired Apple Watch is the usual noise.

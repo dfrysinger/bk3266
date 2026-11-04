@@ -265,6 +265,41 @@ class PklgTests(unittest.TestCase):
         self.assertIn('sniff interval 320ms', out)
         self.assertIn('reason 0x08 Connection (Supervision) Timeout', out)
 
+    def test_device_filter_and_summary(self):
+        def rec(data):
+            body = (0x6000000000000000).to_bytes(8, 'big') + b'\x01' + data
+            return len(body).to_bytes(4, 'big') + body
+
+        def conn(h, addr):   # Connection Complete: status, handle, bdaddr (little-endian)
+            return rec(bytes([0x03, 11, 0]) + h.to_bytes(2, 'little') + bytes.fromhex(addr.replace(':', ''))[::-1] + b'\x01\x00')
+
+        def ver(h, lmp, mfr):
+            return rec(bytes([0x0C, 8, 0]) + h.to_bytes(2, 'little') + bytes([lmp]) + struct.pack('<HH', mfr, 0x1450))
+
+        def drop(h, reason):
+            return rec(bytes([0x05, 4, 0]) + h.to_bytes(2, 'little') + bytes([reason]))
+        headset, watch = '27:72:1c:9c:a9:ff', '08:95:42:8e:39:34'
+        blob = (conn(0x29, headset) + ver(0x29, 0x09, 0x000E) + conn(0x28, watch) + ver(0x28, 0x0C, 0x004C)
+                + drop(0x28, 0x16) + drop(0x29, 0x22)
+                + conn(0x29, watch) + drop(0x29, 0x16))      # handle number reused by another device
+        path = Path(tempfile.mkdtemp()) / 'c.pklg'
+        path.write_bytes(blob)
+        full = run(['pklg', str(path)])
+        self.assertIn('likely Beken', full)
+        self.assertIn('Apple: watch', full)
+        self.assertIn('disconnect reasons 0x16x2', full)
+        events = run(['pklg', str(path), '--device', headset]).split('(')[0]
+        self.assertIn('reason 0x22', events)
+        self.assertNotIn(watch, events)
+        self.assertEqual(events.count('Disconnection Complete'), 1)
+
+        # A link that was up before the trace: found by handle, and the filter stays on after it ends.
+        pre = drop(0x15, 0x13) + conn(0x10, watch) + drop(0x10, 0x16)
+        path.write_bytes(pre)
+        out = run(['pklg', str(path), '--handle', '0x15'])
+        self.assertEqual(out.split('(')[0].count('Disconnection Complete'), 1)
+        self.assertIn('already up when the trace started', run(['pklg', str(path)]))
+
 
 if __name__ == '__main__':
     unittest.main()

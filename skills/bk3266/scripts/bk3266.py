@@ -706,9 +706,30 @@ def pklg_records(blob: bytes):
 
 
 def cmd_pklg(a):
+    """Phone captures contain every device the phone talks to (watch, earbuds, car...). Use the summary at the
+    end to identify the headset (BK3266 parts report LMP 0x09 / manufacturer 0x000e; Apple devices 0x004c),
+    then re-run with --device ADDR (or --handle H for a link that was up before the trace started)."""
     blob = Path(a.capture).read_bytes()
     handles = {}
+    devices = {}
+    want_addr = a.device.lower() if a.device else None
+    want = {int(h, 0) for h in a.handle}
+    filtering = bool(want_addr or want)
+    preexisting = set()     # handles with traffic but no Connection Complete: links up before the trace began
     count = 0
+
+    def dev(addr):
+        return devices.setdefault(addr, dict(connections=0, disconnects={}, version=None, name=None))
+
+    def show(h, line, addr=None):
+        addr = addr or handles.get(h)
+        if h is not None and addr is None:
+            preexisting.add(h)
+        if not filtering:
+            print(line)
+        elif (addr is not None and addr == want_addr) or (h is not None and h in want):
+            print(line)
+
     for t, kind, data in pklg_records(blob):
         count += 1
         stamp = time.strftime('%H:%M:%S', time.localtime(t)) + f'.{int(t % 1 * 1000):03d}'
@@ -723,37 +744,68 @@ def cmd_pklg(a):
                     extra = f' max {mx * 0.625:.0f}ms min {mn * 0.625:.0f}ms attempt {att} timeout {to}'
                 if op == 0x0406 and len(p) >= 3:
                     extra = f' reason {p[2]:#04x} {HCI_REASONS.get(p[2], "")}'
-                print(f'{stamp}  CMD  {name} handle {int.from_bytes(p[:2], "little") & 0xFFF:#x}{extra}')
+                h = int.from_bytes(p[:2], "little") & 0xFFF
+                show(h, f'{stamp}  CMD  {name} handle {h:#x}{extra}')
         elif kind == 0x01 and len(data) >= 2:  # HCI event
             code, p = data[0], data[2:]
             if code == 0x03 and len(p) >= 9 and p[0] == 0:
                 h = int.from_bytes(p[1:3], 'little') & 0xFFF
                 addr = ':'.join(f'{b:02x}' for b in reversed(p[3:9]))
                 handles[h] = addr
-                print(f'{stamp}  EVT  Connection Complete handle {h:#x} {addr}')
+                dev(addr)['connections'] += 1
+                show(h, f'{stamp}  EVT  Connection Complete handle {h:#x} {addr}')
             elif code == 0x05 and len(p) >= 4:
                 h = int.from_bytes(p[1:3], 'little') & 0xFFF
-                print(f'{stamp}  EVT  ** Disconnection Complete ** handle {h:#x} {handles.get(h, "")} '
-                      f'reason {p[3]:#04x} {HCI_REASONS.get(p[3], "")}')
+                addr = handles.get(h)
+                if addr:
+                    r = dev(addr)['disconnects']
+                    r[p[3]] = r.get(p[3], 0) + 1
+                show(h, f'{stamp}  EVT  ** Disconnection Complete ** handle {h:#x} {addr or ""} '
+                        f'reason {p[3]:#04x} {HCI_REASONS.get(p[3], "")}')
+                handles.pop(h, None)
+                want.discard(h)
             elif code == 0x0C and len(p) >= 8 and p[0] == 0:  # Read Remote Version Information Complete
                 h = int.from_bytes(p[1:3], 'little') & 0xFFF
                 mfr, subver = struct.unpack('<HH', p[4:8])
-                print(f'{stamp}  EVT  Remote Version handle {h:#x} {handles.get(h, "")} LMP {p[3]:#04x} '
-                      f'manufacturer {mfr:#06x} subversion {subver:#06x}')
+                if h in handles:
+                    dev(handles[h])['version'] = (p[3], mfr, subver)
+                show(h, f'{stamp}  EVT  Remote Version handle {h:#x} {handles.get(h, "")} LMP {p[3]:#04x} '
+                        f'manufacturer {mfr:#06x} subversion {subver:#06x}')
             elif code == 0x07 and len(p) >= 7 and p[0] == 0:  # Remote Name Request Complete
                 name = p[7:].split(b'\x00', 1)[0].decode(errors='replace')
                 addr = ':'.join(f'{b:02x}' for b in reversed(p[1:7]))
-                print(f'{stamp}  EVT  Remote Name {addr} {name!r}')
+                dev(addr)['name'] = name
+                show(None, f'{stamp}  EVT  Remote Name {addr} {name!r}', addr)
             elif code == 0x14 and len(p) >= 6:
                 h = int.from_bytes(p[1:3], 'little') & 0xFFF
                 iv = int.from_bytes(p[4:6], 'little')
-                print(f'{stamp}  EVT  Mode Change handle {h:#x} -> {MODES.get(p[3], p[3])} '
-                      f'interval {iv * 0.625:.0f}ms status {p[0]:#04x}')
+                show(h, f'{stamp}  EVT  Mode Change handle {h:#x} -> {MODES.get(p[3], p[3])} '
+                        f'interval {iv * 0.625:.0f}ms status {p[0]:#04x}')
             elif code == 0x0F and len(p) >= 4:
                 op = int.from_bytes(p[2:4], 'little')
                 if p[0] and op in (0x0803, 0x0804, 0x0406):
-                    print(f'{stamp}  EVT  Command Status FAILED op {op:#06x} status {p[0]:#04x}')
+                    show(None, f'{stamp}  EVT  Command Status FAILED op {op:#06x} status {p[0]:#04x}')  # no handle
     print(f'({count} records)')
+    if devices or preexisting:
+        print('\nDevices seen (identify the headset, then re-run with --device ADDR):')
+        for addr, d in devices.items():
+            v = d['version']
+            kind = ''
+            if v:
+                if v[1] == 0x004C:
+                    kind = '  [Apple: watch/earbuds/Mac, not your headset]'
+                elif v[1] == 0x000E:
+                    kind = '  [likely Beken/BK3266 (Ceva baseband, manufacturer 0x000e)]'
+            ver = f'LMP {v[0]:#04x} mfr {v[1]:#06x} subver {v[2]:#06x}' if v else 'version not captured'
+            drops = ', '.join(f'{r:#04x}x{n}' for r, n in sorted(d['disconnects'].items())) or 'none'
+            name = f' {d["name"]!r}' if d['name'] else ''
+            print(f'  {addr}{name}  {ver}  connections {d["connections"]}  disconnect reasons {drops}{kind}')
+    if preexisting:
+        print('Links already up when the trace started (address unknown; inspect with --handle): '
+              + ', '.join(f'{h:#x}' for h in sorted(preexisting))
+              + '\n  Tip: start the trace before powering the headset on, so its address and version are captured.')
+    if handles:
+        print('Links still up at end of trace: ' + ', '.join(f'{h:#x}={a}' for h, a in handles.items()))
 
 
 # --------------------------------------------------------------------------
@@ -847,6 +899,9 @@ def main(argv=None):
 
     p = sub.add_parser('pklg', help='summarize sniff/disconnect events in an Apple PacketLogger capture')
     p.add_argument('capture')
+    p.add_argument('--device', metavar='ADDR', help='only show events for this Bluetooth address (aa:bb:cc:dd:ee:ff)')
+    p.add_argument('--handle', action='append', default=[],
+                   help='also show this connection handle (e.g. 0x15) for a link that was up before the trace began')
     p.set_defaults(fn=cmd_pklg)
 
     a = ap.parse_args(argv)

@@ -192,8 +192,11 @@ To check whether your device has the same failure, capture the HCI disconnect re
 Android HCI snoop log, then:
 
 ```sh
-python3 $S pklg capture.pklg     # sniff requests, mode changes, remote firmware version, disconnect reason codes
+python3 $S pklg capture.pklg                              # all events + a "Devices seen" table to identify the headset
+python3 $S pklg capture.pklg --device 27:72:1c:9c:a9:ff   # only the headset: sniff requests, mode changes, disconnect reasons
 ```
+A phone capture includes every device the phone talks to (watch, earbuds, car). Identify the headset in the summary first:
+BK3266 parts report LMP `0x09` and manufacturer `0x000E`. Apple devices report `0x004C`.
 Step-by-step capture guide and experiments: [disconnects.md](skills/bk3266/references/disconnects.md).
 
 ---
