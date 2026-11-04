@@ -9,13 +9,15 @@ Bluetooth headphones, sleep headbands, speakers, car kits and audio receivers. W
   timeouts, auto-reconnect, sniff / power saving
 - **mute or replace voice prompts** ("battery low", "connected", "disconnected", "power on", "pairing")
 - **disassemble the firmware**: the BK3266 core is **BA2 (Beyond Architecture 2), not ARM**
-- diagnose **Bluetooth disconnect / reconnect loops** from an iPhone PacketLogger capture
+- **turn on the firmware's hidden debug log** (one config bit) and read it over the same UART wires
+- **patch code safely**: byte-exact replacement with old-bytes check, CRC repair and disassembly read-back
+- diagnose **Bluetooth disconnect / reconnect loops** from an iPhone PacketLogger capture and the headset's own log
 
 The project is a single Python script (`bk3266.py`) plus an **agent skill** for Claude Code, OpenAI Codex CLI and GitHub
 Copilot CLI. The skill teaches an AI coding agent the protocol and the safety rules.
 
-> **Status:** reading flash, decoding the config, writing a config change, rebooting out of download mode and the
-> disconnect-loop fix are all verified on real hardware (BK3266, 512 KiB Puya flash, firmware built 2021). Other flash sizes or firmware builds may need `--config-base`. Check the
+> **Status:** reading flash, decoding the config, writing config and code changes, rebooting out of download mode,
+> the debug UART log and the disconnect-loop fix are all verified on real hardware (BK3266, 512 KiB Puya flash, firmware built 2021). Other flash sizes or firmware builds may need `--config-base`. Check the
 > [field confidence notes](skills/bk3266/references/config-map.md) before writing.
 
 ---
@@ -159,6 +161,8 @@ Full map with confidence levels: [config-map.md](skills/bk3266/references/config
 | Mute the connected / disconnected announcements | `patch --mute-prompt connected --mute-prompt disconnected` |
 | Make all voice prompts quieter | `patch --set vol_wave=5` |
 | **Stop it disconnecting ~30 s after audio stops** (confirmed fix) | `patch --clear-bits feature_flag=0x80000` (see [§7](#7-why-do-bk3266-headphones-disconnect-and-reconnect-when-audio-stops)) |
+| **Turn on the firmware's debug log** (115200 8N1 on the flashing pads) | `patch --set-bits system_flag=0x1`, then `listen --port …` |
+| Replace exact code bytes (refuses if the old bytes differ) | `patch --poke 0x2bb6f=2481da:2c815a`, then `write … --allow-any-sector` |
 | Lengthen the idle timer instead | `patch --set sleep_timeout=12000` (120 s) |
 | Extract the voice prompts as WAV | `prompts dump.bin -o voice-prompts` (needs ffmpeg) |
 
@@ -172,13 +176,27 @@ python3 $S info dump.bin --strings              # debug strings: the best map of
 Ghidra has no stock BA2 module. Navigate by the firmware's debug strings and by HCI opcode immediates.
 More: [reverse-engineering.md](skills/bk3266/references/reverse-engineering.md).
 
+### The BK3266 debug UART log
+
+Production firmware is silent on UART, but the logger is still there. On 2021 firmware, `system_flag` bit `0x1`
+(config `+0x01`) gates the UART init at 115200 8N1 on the same pads as the bootloader. Set it, and the headset prints its
+Bluetooth stack's own trace: `sniff enable`, `enter sniff`, `ep.unit_mode=…`, `disconn_compl … 0x22`, battery millivolts and more.
+```sh
+python3 $S patch dump.bin -o debug.bin --set-bits system_flag=0x1     # 3 bytes, undo with --clear-bits
+python3 $S listen --port /dev/cu.usbserial-XXXX --grep 'sniff|unit_mode|disconn'
+```
+With it on, running firmware also ACKs the LinkCheck frame. Switch the headset off before catching the bootloader.
+Details: [debug-uart.md](skills/bk3266/references/debug-uart.md).
+
 ## 7. Why do BK3266 headphones disconnect and reconnect when audio stops?
 
 **Diagnosed and fixed on real hardware (iPhone and a BK3266 sleep headband):**
 
-- **Cause:** about 30 s after audio stops, the firmware's idle timer (`sleep_timeout`) allows Bluetooth **sniff mode** and also
-  requests it. The iPhone asks for sniff too, and the headset **never answers the phone's request**. Exactly 30 s later the phone
-  drops the link with HCI reason **`0x22` LMP Response Timeout**. Auto-reconnect turns that into a "disconnected… connected…" loop.
+- **Cause:** about 30 s after audio stops, the firmware's idle timer (`sleep_timeout`) switches the link policy to allow Bluetooth
+  **sniff mode**. When the iPhone then asks for sniff (240 ms, attempt 1, timeout 1), the headset's link manager judges the
+  parameters invalid. Its own debug log shows Mode Change status **`0x1E` Invalid LMP Parameters**, but it **never sends a
+  reply to the phone**. Exactly 30 s later the phone drops the link with HCI reason **`0x22` LMP Response Timeout**. Auto-reconnect
+  turns that into a "disconnected… connected…" loop. Sniff that the headset starts itself (320 ms) works fine.
 - **Fix:** clear one config bit, `feature_flag` `0x80000`. The headset then refuses sniff straight away (`status 0x24`),
   iOS stops asking, and the link stays up. In testing: 20 minutes idle, zero drops.
   ```sh
@@ -197,7 +215,8 @@ python3 $S pklg capture.pklg --device 27:72:1c:9c:a9:ff   # only the headset: sn
 ```
 A phone capture includes every device the phone talks to (watch, earbuds, car). Identify the headset in the summary first:
 BK3266 parts report LMP `0x09` and manufacturer `0x000E`. Apple devices report `0x004C`.
-Step-by-step capture guide and experiments: [disconnects.md](skills/bk3266/references/disconnects.md).
+Step-by-step capture guide, the side-by-side phone/headset logs, and every experiment tried so far:
+[disconnects.md](skills/bk3266/references/disconnects.md).
 
 ---
 

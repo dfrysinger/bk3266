@@ -1,6 +1,6 @@
 {
   "name": "bk3266",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Back up, decode, patch and safely re-flash Beken BK3266 Bluetooth audio chips over UART, and diagnose their Bluetooth drops.",
   "author": {
     "name": "Daniel Frysinger"

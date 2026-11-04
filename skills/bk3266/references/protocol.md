@@ -66,8 +66,22 @@ but **not** after a failed write, so you can retry or restore. Use `--no-reboot`
 | `01 E0 FC 06 0F <baud:u32 LE> <delay>` | builder `0x402110`, wrapper `0x404350` | Baud change (115200, 1M or 2M). Not needed. |
 | `01 E0 FC 05 FE 95 27 95 27` | builder `0x4022B0` | Sent on failed connects. Unknown. |
 
+**Checking that the reboot worked:** the bootloader listens briefly at every reset, so a LinkCheck probe sent right after
+the reboot can catch it again. `reboot` waits 3 s in silence first, then requires **both** handshakes before it concludes
+"still in download mode". Running firmware with the debug UART on answers LinkCheck too (see below).
+
+## Running firmware answers LinkCheck when its debug UART is on
+
+With `system_flag` bit `0x1` set, the application firmware ACKs `01 E0 FC 01 00` with the same `04 0E 05 01 E0 FC 01 00`,
+but ignores AA/55, and prints log text such as `+++adc:3334(mV)…`. An instant ACK followed by printable text means
+**the headset is on**. Switch it off, then press and hold to catch the real bootloader. `connect()` handles this: it retries
+until both handshakes answer, and says so if it sees log text.
+
 ## Practical timing
 
 - The catch window is short and it can take several presses. Spam LinkCheck continuously and let the owner keep trying.
   `bk3266.py` listens for 5 minutes.
+- **Catch from a powered-off headset.** Pressing to reset a running headset into the bootloader can interrupt a
+  pairing-log write and leave weakly programmed bits (see [flash-format.md](flash-format.md)).
+- A chip already in download mode answers within milliseconds. The tool then skips the "press and hold" cue.
 - A full 512 KiB read takes about 60 s at 115200.

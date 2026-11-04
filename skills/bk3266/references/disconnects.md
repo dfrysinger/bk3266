@@ -30,11 +30,12 @@ The headset reports LMP version `0x09` (BT 5.0), manufacturer `0x000E`, subversi
 09:32:07  EVT  Disconnection Complete reason 0x22 LMP Response Timeout
 ```
 
-The 30 s is the LMP response timeout, not the idle timer. In code, the link policy written at connection is role-switch
+The 30 s is the LMP response timeout, not the idle timer (the matching `sleep_timeout` of 30 s is a coincidence). In code, the link policy written at connection is role-switch
 only (`0xC2 | 1` at `0x2B1AD`), so sniff is **refused** until the idle path (`0x2654C`, gated by `feature_flag & 0x80000`)
 turns policy bit `0x4` on and starts the headset's own sniff entry. Every unanswered request in the capture fell inside that
-window. That's consistent with a collision between phone- and headset-initiated sniff. With the bit cleared, the policy stays
-"refuse", and refusal is proven to work (the `0x24` above). That makes `--clear-bits feature_flag=0x80000` the first fix to try.
+window. (We first suspected a collision between phone- and headset-initiated sniff; the headset's own log, below, ruled
+that out.) With the bit cleared, the policy stays "refuse", and refusal is proven to work (the `0x24` above). That makes
+`--clear-bits feature_flag=0x80000` the first fix to try.
 
 ### Fix confirmed: clear `feature_flag` bit `0x80000` (same board, same phone, 2026-11-03)
 
@@ -51,9 +52,40 @@ After one clean refusal, iOS stops asking and keeps the link active. The cost is
 During A2DP streaming the firmware refuses sniff anyway, so all-night audio is unaffected. A multi-night battery
 comparison is still pending.
 
-**Why not "phone-initiated sniff only"?** It's possible with a code patch: at `0x2B1B4` change `ori r6,r6,0x1` to `0x5` so the
-connection policy allows sniff, and clear the feature bit so the headset never initiates it. That's a code-sector write, and
-it only helps if the failure needs both sides to initiate sniff together. It's untested.
+### Root cause, from the headset's own log (2026-11-04)
+
+With the [debug UART](debug-uart.md) on and the Mode Change log line widened to print the status, the phone trace and
+the headset log line up to the second (sniff re-enabled, i.e. stock behaviour):
+
+| Time | Phone (PacketLogger) | Headset (debug UART) |
+|---|---|---|
+| 14:16:10 | Sniff Mode 240 ms → **refused `0x24`**, link fine | (nothing: policy still "refuse") |
+| 14:16:25 | | `sniff enable` (idle timer: policy now allows sniff) |
+| 14:16:55 | Mode Change → sniff 320 ms | `enter sniff` → `ep.unit_mode=2003200` (mode 2, status 00): **headset-initiated sniff works** |
+| 14:17:02 | Mode Change → active | `ep.unit_mode=3200` |
+| 14:17:17 | **Sniff Mode 240 ms, attempt 1, timeout 1** | `ep.unit_mode=321e`: mode 0, **status `0x1E` Invalid LMP Parameters**, same second |
+| 14:17:32 | | `enter sniff` (own retry), no result |
+| 14:17:47 | Disconnection Complete `0x22` | `disconn_compl … 0x22` |
+
+**When its policy allows sniff, the headset's link manager judges the iPhone's sniff parameters invalid, reports
+`0x1E` to its own host, and never sends LMP_not_accepted back over the air.** The phone waits out the 30 s LMP response
+timeout and drops the link, and the headset's own retries go nowhere in the meantime. Refusal (`0x24`) is
+answered properly, and sniff that the headset initiates (320–400 ms, attempt 4, timeout 4) works in both directions.
+The bug is in the controller's handling of a *remote* sniff request it considers invalid. The host stack only logs the
+symptom. The first connection of the earlier capture showed that the headset doesn't need to have initiated sniff for this to happen.
+
+### Experiments, and what each one ruled out
+
+| Patch | Result | Verdict |
+|---|---|---|
+| Clear `feature_flag` `0x80000` | Policy never allows sniff; phone gets `0x24` once, stops asking; no drops (20 min) | **Fix.** No idle sniff. |
+| Stock + debug UART | `0x1E` on phone-initiated sniff, then `0x22` | Root cause (above) |
+| Policy never allows sniff, but headset still initiates its own (`0x265B1` `ori r7,r7,0x4` → `0x0`, `--poke 0x265b1=38e720:38e700`) | Stable (6.5 min, one link), phone refused once. **But all 10 headset `enter sniff` attempts were silently rejected**: no Mode Change | The controller enforces local link policy on locally initiated sniff too. Same outcome as the fix. |
+| Moving `sleep_timeout` (e.g. 45 s or 20 s) | Not run | Only moves when the "allow" window opens. A shorter timer makes it worse. |
+
+Paths still open toward "sniff with no drops": toggle the policy around the headset's own sniff entry (allow → Sniff Mode
+→ refuse once in sniff), or fix the link manager so that it answers LMP_not_accepted (or accepts 240 ms). Both are code patches.
+Find the link manager's sniff_req handler by searching for where it produces `0x1E`.
 
 ### Capture hygiene
 
@@ -101,6 +133,11 @@ This prints sniff requests, Mode Change events (active ↔ sniff, with interval)
 | `0x13` | Remote user terminated | The *other* side chose to disconnect (from the phone's log, that's the headset). |
 | `0x16` | Terminated by local host | The side that logged it chose to disconnect (from the phone's log, that's the phone's own decision). |
 | `0x1A` | Unsupported remote feature | Sniff or feature negotiation mismatch. |
+
+## Step 1b: read the headset's side (debug UART)
+
+The phone's capture only shows what the phone saw. Turn on the headset's own log first ([debug-uart.md](debug-uart.md)):
+it's a 3-byte config write that's easy to undo, and it shows every sniff, mode change and disconnect from the inside.
 
 ## Step 2: bounded firmware experiments (practice board, one change at a time)
 

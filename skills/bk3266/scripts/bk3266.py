@@ -175,6 +175,7 @@ HELLO_ACK = bytes.fromhex('04 0e 05 01 e0 fc aa 55')
 # Without it the chip stays in download mode for as long as it has power (battery boards: until flat),
 # which looks like a dead headset: no LEDs, no charge light, power button ignored.
 REBOOT = bytes.fromhex('01 e0 fc 02 0e a5')
+REBOOT_SETTLE = 3.0   # seconds of silence after reboot: probing inside the reset listen window re-catches the chip
 EXT_TX = bytes.fromhex('01 e0 fc ff f4')
 EXT_RX = bytes.fromhex('04 0e ff 01 e0 fc f4')
 CMD_WRITE, CMD_READ, CMD_ERASE, CMD_RDSR, CMD_WRSR, CMD_SPI = 0x07, 0x09, 0x0B, 0x0C, 0x0D, 0x0E
@@ -227,12 +228,42 @@ class Link:
         raise TimeoutError(f'no reply {expected.hex(" ")}')
 
     def connect(self, wait: float, voice: bool) -> None:
+        """Catch the bootloader: LinkCheck ACK *and* the second handshake.
+
+        A chip already in download mode answers at once, so the press cue is only
+        spoken if nothing answers within 0.3 s. Running firmware with the debug UART
+        enabled also ACKs LinkCheck (but not the second handshake) and prints log
+        text; keep trying until the real bootloader answers both, and tell the owner
+        to switch the headset off first."""
         self.port.reset_input_buffer()
-        say(voice, 'Press and hold the power button now.')
-        self.handshake(LINKCHECK, LINKCHECK_ACK, wait)
-        self.handshake(HELLO, HELLO_ACK, 1.0)
+        deadline = time.monotonic() + wait
+        prompted = warned = False
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('bootloader not caught (no LinkCheck + second-handshake reply)')
+            try:
+                self.handshake(LINKCHECK, LINKCHECK_ACK, min(left, 0.3) if not prompted else left)
+            except TimeoutError:
+                if not prompted:
+                    say(voice, 'Press and hold the power button now.')
+                    prompted = True
+                continue
+            try:
+                self.handshake(HELLO, HELLO_ACK, 1.0)
+                break
+            except TimeoutError:
+                if not warned and re.search(rb'[ -~]{12,}', bytes(self.buffer)):
+                    print('The headset firmware is running (its debug log is on this UART). '
+                          'Switch the headset off, then press and hold power when asked.', flush=True)
+                    say(voice, 'The headset is on. Turn it off, then press and hold power.')
+                    warned = prompted = True
+                self.buffer.clear()
         self.buffer.clear()
-        say(voice, 'Connected. You can let go of the button.')
+        if prompted:
+            say(voice, 'Connected. You can let go of the button.')
+        else:
+            print('Chip was already in download mode.', flush=True)
 
     def request(self, cmd: int, args: bytes = b'', seconds: float = 5) -> bytes:
         payload = bytes([cmd]) + args
@@ -411,6 +442,63 @@ def cmd_dump(a):
         sys.exit(2)
 
 
+def cmd_listen(a):
+    """Record the firmware's debug UART (enable with --set-bits system_flag=0x1). Never transmits."""
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    raw_path, txt_path = out / f'uart-{stamp}.raw', out / f'uart-{stamp}.txt'
+    pattern = re.compile(a.grep.encode(), re.I) if a.grep else None
+    with open_port(a.port) as port:
+        port.baudrate = a.baud
+        end = time.monotonic() + a.seconds if a.seconds else None
+        line = b''
+        total = 0
+        print(f'listening on {a.port} @ {a.baud}; power the headset on now (Ctrl-C to stop)', flush=True)
+        with raw_path.open('xb') as raw, txt_path.open('x', encoding='utf-8') as txt:
+            try:
+                while end is None or time.monotonic() < end:
+                    data = port.read(4096)
+                    if not data:
+                        time.sleep(0.02)
+                        continue
+                    total += len(data)
+                    raw.write(data)
+                    raw.flush()
+                    line += data
+                    while b'\n' in line:
+                        one, line = line.split(b'\n', 1)
+                        one = one.rstrip(b'\r')
+                        text = f'{time.strftime("%H:%M:%S")} {one.decode("latin-1")}'
+                        txt.write(text + '\n')
+                        txt.flush()
+                        if pattern is None or pattern.search(one):
+                            print(text, flush=True)
+            except KeyboardInterrupt:
+                pass
+    print(f'{total} bytes -> {txt_path}', flush=True)
+    if total <= 2:
+        print('Nothing but line noise. Production firmware is silent unless system_flag bit 0x1 is set '
+              '(see references/debug-uart.md).', flush=True)
+
+
+def same_outside(got: bytes, want: bytes, ignored, label: str, manifest: dict) -> bool:
+    """Compare two images, skipping firmware-managed ranges the owner named with --ignore-range.
+
+    Differences inside an ignored range are printed and recorded, never hidden."""
+    diff = [i for i in range(len(want)) if got[i] != want[i]]
+    skipped = [i for i in diff if any(lo <= i < hi for lo, hi in ignored)]
+    for i in skipped:
+        print(f'  {label}: ignoring raw {i:#07x} {want[i]:02x} vs {got[i]:02x} (inside --ignore-range)', flush=True)
+    if skipped:
+        manifest.setdefault('ignored_differences', []).extend(
+            dict(image=label, raw=hex(i), want=f'{want[i]:02x}', got=f'{got[i]:02x}') for i in skipped)
+    real = [i for i in diff if i not in set(skipped)]
+    for i in real[:16]:
+        print(f'  {label}: raw {i:#07x} expected {want[i]:02x}, read {got[i]:02x}', flush=True)
+    return not real
+
+
 def cmd_write(a):
     candidate = Path(a.candidate).read_bytes()
     expect = Path(a.expect).read_bytes()
@@ -430,6 +518,14 @@ def cmd_write(a):
         raise SystemExit(f'sectors outside the config region: {[hex(s) for s in outside]} (use --allow-any-sector)')
     if a.max_sectors and len(sectors) > a.max_sectors:
         raise SystemExit(f'{len(sectors)} sectors exceeds --max-sectors {a.max_sectors}')
+    ignored = []
+    for spec in a.ignore_range or []:
+        lo, hi = (parse_int(x) for x in spec.split('-', 1))
+        if lo >= hi:
+            raise SystemExit(f'--ignore-range {spec}: start must be below end')
+        if any(s < hi and s + SECTOR > lo for s in sectors):
+            raise SystemExit(f'--ignore-range {spec} overlaps a sector being written; refusing')
+        ignored.append((lo, hi))
     if not a.yes:
         print('Dry run. Re-run with --yes to write (practice board first; keep two matching backups).')
         return
@@ -453,13 +549,17 @@ def cmd_write(a):
         ok = False
         try:
             link.connect(a.wait, a.say)
+            manifest['connected'] = True
             ident = link.jedec()
             if 1 << ident[2] != len(expect):
                 raise IOError(f'flash size {1 << ident[2]} != image size {len(expect)}')
             before = link.full_read(len(expect), 'pre-image')
             save(ev / 'before.bin', before)
-            if before != expect:
-                raise IOError('device flash != --expect image; nothing written')
+            if not same_outside(before, expect, ignored, 'pre-image', manifest):
+                raise IOError('device flash != --expect image; nothing written. If the differences are in the '
+                              'pairing log (raw 0x7e000-0x7efff), the firmware updated it: re-baseline with '
+                              '`dump --no-reboot`, re-patch that dump, write against it. If the same bits keep '
+                              'flipping between reads, they are unstable: add --ignore-range 0x7e000-0x7f000')
             original_sr = link.status()
             state('PREIMAGE_VERIFIED', jedec=ident.hex(' '), original_sr=original_sr.hex(' '))
             unlock = bytes.fromhex(a.unprotect_value)
@@ -481,7 +581,7 @@ def cmd_write(a):
                 state('PROTECTION_RESTORED')
             after = link.full_read(len(expect), 'post-image')
             save(ev / 'after.bin', after)
-            if after != candidate:
+            if not same_outside(after, candidate, ignored, 'post-image', manifest):
                 raise IOError('post-write full image != candidate')
             state('WRITTEN_AND_VERIFIED', after_sha256=sha(after), final_sr=link.status().hex(' '))
             say(a.say, 'Write verified.')
@@ -505,7 +605,9 @@ def cmd_write(a):
                 except BaseException as exc:
                     manifest['protection_restore_error'] = repr(exc)
                 (ev / 'manifest.json').write_text(json.dumps(manifest, indent=2))
-            if not ok:
+            if not ok and not manifest.get('connected'):
+                print('Write did not start: the bootloader was never caught. Nothing was written.', flush=True)
+            elif not ok:
                 print('Write did not complete: chip left in download mode so you can retry or restore.', flush=True)
             finish(link, a, ok)
 
@@ -518,9 +620,15 @@ def cmd_reboot(a):
             port.reset_input_buffer()
             link.handshake(LINKCHECK, LINKCHECK_ACK, a.wait)
             link.reboot()
+            # Stay silent past the bootloader's listen window at reset: probing during it
+            # re-catches the chip. Then require the second handshake too, because running
+            # firmware with its debug UART enabled also ACKs LinkCheck.
+            time.sleep(REBOOT_SETTLE)
+            port.reset_input_buffer()
             link.buffer.clear()
             try:
-                link.handshake(LINKCHECK, LINKCHECK_ACK, 1.0, every=0.1)
+                link.handshake(LINKCHECK, LINKCHECK_ACK, 0.5, every=0.1)
+                link.handshake(HELLO, HELLO_ACK, 0.5)
                 raise SystemExit('chip still answers in download mode after reboot')
             except TimeoutError:
                 print('Rebooted: chip no longer in download mode. Power it on normally.')
@@ -602,6 +710,17 @@ def cmd_patch(a):
         old = read_logical(img, at, 1)[0]
         patch_logical(img, at, b'\x00')
         print(f'prompt slot {slot} ({PROMPT_NAMES.get(slot, "?")}): type {old} -> 0 (unused)')
+    for item in a.poke or []:
+        addr, spec = item.split('=', 1)
+        old_hex, new_hex = spec.split(':', 1)
+        at, old, new = parse_int(addr), bytes.fromhex(old_hex), bytes.fromhex(new_hex)
+        if len(old) != len(new):
+            raise SystemExit(f'--poke {item}: old and new must be the same length')
+        have = read_logical(img, at, len(old))
+        if have != old:
+            raise SystemExit(f'--poke {item}: logical {at:#x} holds {have.hex(" ")}, not {old.hex(" ")}; refusing')
+        patch_logical(img, at, new)
+        print(f'logical {at:#x}: {old.hex(" ")} -> {new.hex(" ")}')
     diff = [i for i in range(len(raw)) if raw[i] != img[i]]
     if crc_extent(bytes(img)) < crc_extent(raw):
         raise SystemExit('patch broke CRC continuity; refusing')
@@ -834,6 +953,14 @@ def main(argv=None):
     p.add_argument('--evidence', type=Path, default=Path('bk3266-evidence'))
     p.set_defaults(fn=cmd_reboot)
 
+    p = sub.add_parser('listen', help="record the firmware's debug UART log (read-only; needs system_flag bit 0x1)")
+    p.add_argument('--port', required=True)
+    p.add_argument('--baud', type=int, default=115200)
+    p.add_argument('--seconds', type=float, default=0, help='stop after N seconds (default: until Ctrl-C)')
+    p.add_argument('--grep', help='only echo matching lines (everything is still saved)')
+    p.add_argument('--out', type=Path, default=Path('bk3266-evidence'))
+    p.set_defaults(fn=cmd_listen)
+
     p = sub.add_parser('dump', help='full flash backup, N passes, require identical')
     device(p)
     p.add_argument('--out', type=Path, default=Path('bk3266-evidence'))
@@ -847,6 +974,10 @@ def main(argv=None):
     p.add_argument('--expect', required=True, help='image the device must currently contain (your verified backup)')
     p.add_argument('--yes', action='store_true')
     p.add_argument('--allow-any-sector', action='store_true', help='permit sectors outside the config region')
+    p.add_argument('--ignore-range', action='append', metavar='START-END',
+                   help='raw range excluded from the before/after full-image comparison, e.g. 0x7e000-0x7f000 for '
+                        'the firmware-managed pairing log when it has unstable bits. Refuses if it overlaps a '
+                        'sector being written; ignored differences are printed and recorded')
     p.add_argument('--max-sectors', type=int, default=4)
     p.add_argument('--unprotect-value', default='00 00', help='SR1 SR2 to write while programming')
     p.add_argument('--unprotect-value-confirmed', action='store_true')
@@ -872,6 +1003,9 @@ def main(argv=None):
     p.add_argument('--clear-bits', action='append', metavar='FIELD=MASK')
     p.add_argument('--set-bits', action='append', metavar='FIELD=MASK')
     p.add_argument('--mute-prompt', action='append', metavar='NAME|SLOT', help=f'one of {sorted(PROMPT_SLOTS)}')
+    p.add_argument('--poke', action='append', metavar='LOGICAL=OLDHEX:NEWHEX',
+                   help='replace bytes at a logical (CRC-stripped) address; refuses unless the old bytes match. '
+                        'For code patches: write needs --allow-any-sector outside the config region')
     cfgbase(p)
     p.set_defaults(fn=cmd_patch)
 

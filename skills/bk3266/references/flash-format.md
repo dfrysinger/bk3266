@@ -34,6 +34,18 @@ Records straddle sector boundaries, so preserve every other byte of the sector e
 | `0x7E000` | — | Paired-device / link-key log, not CRC-paged. Loaded into RAM at boot (`0x392DD`; `0xFE000` on 1 MiB parts). **The firmware appends to it whenever it runs**, so re-dump before every write. |
 | `0x7F000` | — | Environment record (`BK326601`), not CRC-paged. **Preserve it.** It holds pairing and calibration data. |
 
+### Unstable bits in the pairing log
+
+On the practice board, single bits in the `0x7E000` sector flip between consecutive reads, for example `0x7E114` `6C`/`68`,
+`0x7EB1C` `92`/`B2`, `0x7E310` `1D`/`1C`. Each is a 1→0 programming change that read differently on different passes.
+The likely cause is a program cycle interrupted when a running headset was reset into the bootloader, which leaves cells near the threshold.
+The firmware erases and rewrites the log itself when it fills, which clears them. Effects:
+
+- `dump` may report "Backups differ". Check with `cmp -l` whether only `0x7E000`–`0x7EFFF` differs.
+- `write`'s strict full-image compare fails at random. When the sectors being written are elsewhere, pass
+  `--ignore-range 0x7e000-0x7f000`. It refuses to cover a sector being written, and prints and records every ignored difference.
+- Prevention: catch the bootloader from a powered-off headset.
+
 `bk3266.py info` reports the CRC-valid extent of any dump.
 
 ## Voice prompts

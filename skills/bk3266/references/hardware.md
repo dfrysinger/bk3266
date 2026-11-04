@@ -15,12 +15,26 @@ On other boards:
 2. Wire the adapter's RX to your best guess for chip TX, adapter TX to chip RX, and GND to battery negative or board ground.
 3. Run `bk3266.py ping` and press power. If nothing happens after a few tries, swap TX and RX. That's harmless at 3.3 V with a series resistor.
 
-**Don't connect the adapter's VCC/red wire.** Power the board from its own LiPo (or bench supply on B+/B−).
+**Don't connect the adapter's VCC/red wire to the board.** Power the board from its own LiPo (or bench supply on B+/B−).
 The application firmware normally prints nothing on UART, so a silent line is expected until the bootloader answers.
+Setting one config bit turns on its debug log at 115200 on these same pads ([debug-uart.md](debug-uart.md)).
 
 ## Catching the bootloader
 The ROM bootloader listens briefly at power-on. The host must already be sending LinkCheck when the owner
 **presses and holds the power button**. It can take a few presses. Once `ping` says connected, the button can be released.
+**Start with the headset switched off.** Resetting a running headset into the bootloader can interrupt a flash write.
+
+## Letting the host press the button (planned, not yet built)
+An FTDI cable's RTS line (green on the TTL-232R-3V3 and on Adafruit's FT232R cables) can drive an optocoupler wired across
+the power-button contacts. That presses the button electrically, whatever polarity the button has:
+
+```
+adapter 3.3 V (red) ── 1 kΩ ── PC817 pin 1 (anode)
+adapter RTS (green) ────────── PC817 pin 2 (cathode)     RTS asserted = low = "pressed"
+PC817 pin 4 (collector) / pin 3 (emitter) across the button; swap if it doesn't respond
+```
+Here the red wire feeds only the LED, never the board. Opening a serial port can assert RTS for a moment, so host code must
+force RTS off before opening. A blip of a few ms is far shorter than a power press.
 
 ## Practice discipline
 - Use a spare board for anything that writes. Keep two matching full backups per board (`dump`).

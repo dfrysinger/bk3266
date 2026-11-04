@@ -10,7 +10,7 @@ Confidence: **V** = verified in firmware code or by a hardware write; **T** = fr
 | Field | Off | Type | Units / meaning | Conf |
 |---|---:|---|---|:-:|
 | `used` | `0x000` | u8 | 1 = config active | V |
-| `system_flag` | `0x001` | u32 | bitfield. The ToolKit's "sniff enable" checkbox writes bit `0x80000` here, **but 2021 firmware doesn't read it for sniff** | T |
+| `system_flag` | `0x001` | u32 | bitfield. **Bit `0x1` = debug UART on** (115200 8N1; see [debug-uart.md](debug-uart.md)). The ToolKit's "sniff enable" checkbox writes bit `0x80000` here, **but 2021 firmware doesn't read it for sniff** | V (bit 0x1: code + hardware); T (rest) |
 | `vol_a2dp` / `vol_hfp` / `vol_wave` / `vol_mic` | `0x009`–`0x00C` | u8 | default volume indexes. `vol_wave` affects all prompts | T |
 | `lp_channel` | `0x00D` | u8 | battery ADC channel | T |
 | `lp_interval` | `0x00E` | u32 | 10 ms ticks (6000 = 60 s) battery-check interval | T |

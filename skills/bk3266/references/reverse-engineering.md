@@ -19,7 +19,7 @@ A linear sweep mixes code with embedded data. Treat it as a map, not a function 
 
 ## Navigation strategy
 
-1. **Debug strings are the index.** The firmware is full of `printf`-style strings even though UART logging is off.
+1. **Debug strings are the index.** The firmware is full of `printf`-style strings even though UART logging is off by default.
    Run `info --strings` and look for handler names such as `app_hci_discon_compl_cb`, `bt_disconn_reason: 0x%x`, `sniff disable:%d`,
    `exit sniff`, `===sleep slots`, `icu_deepsleep`, `Reconnection after disconnection`, and the battery and wave messages.
 2. Find the code that loads each string's logical address. Those are the handlers.
@@ -46,7 +46,40 @@ A linear sweep mixes code with embedded data. Treat it as a map, not a function 
 | `0x40D1E` | A2DP stream suspend |
 | `0x41ECC` | app disconnect wrapper: logs `bt_disconn_reason`, plays prompt 2, reason-specific branches (`0x13/0x16`, `0x08/0x05`, `0x22`), reconnect at `0x42370` |
 
+| `0x2B1AD` | on connection: link policy `0xC2(r12) |= 1` (role switch only), HCI Write Link Policy |
+| `0x265B1` | the **only** place that sets policy bit `0x4` (allow sniff), in the enable half of `0x2654C` |
+| `0x2BB21`–`0x2BB78` | HCI Mode Change handler: event at `r1+0x58` (`status, handle, mode, interval`), toggles the per-link "active" byte (`0x12A4 + 12*i`) only on status 0, logs `ep.unit_mode` |
+| `0x3966C` / `0x3A6BD` | UART init (`0xE01B` → `0xF08000`, 115200 8N1), gated by `system_flag` bit 0 / `used != 1` |
+| `0x30070` / `0x30084` | idle path per link: first tick calls policy-enable `0x2654C(h,1)`, next tick (if still active) `0x220CD(h,1)` enter sniff |
+
 Other builds will have different addresses but the same strings. Re-derive them from the strings.
+
+## Turn on the debug log before guessing
+
+The single most useful step is enabling the firmware's own UART log ([debug-uart.md](debug-uart.md)). Search for the
+UART init (store to `0xF08000`) and the config bit that gates it. Then every hypothesis can be checked against the headset's
+own account, not just against what the phone saw.
+
+## Patching code
+
+Code patches use the same safety rails as config patches. They need `--allow-any-sector` at write time, and there's one
+extra step: **disassemble the patched image and read it back** before showing anyone the diff.
+
+1. Find the instruction, and confirm every other place that touches the same state (grep the listing for the offset or the bit).
+2. Get the encoding from an existing instruction of the same form. **Don't hand-encode BA2 immediates**: they aren't stored
+   plainly. In `bn.ori`/`bn.andi`/`bn.lbz` the 8-bit field is bit-reversed (`ori 0x1` → `80`, `ori 0x4` → `20`, `lbz 0x5b` → `da`),
+   and `bn.lwz` uses yet another layout (`0x58` → `5a`). Pick one with the same register and opcode from the listing and copy it.
+3. Keep the length the same, so nothing else moves. Changing only an immediate or a register field is the safest edit.
+4. `patch --poke LOGICAL=OLDHEX:NEWHEX` refuses unless the old bytes match, then fixes the record CRC.
+5. `disasm --raw patched.bin --start … --end …` must show the intended instruction with unchanged neighbours.
+6. Start with patches that can't change behaviour (log arguments), so you exercise the write path on code sectors first.
+
+Patches made so far (2021 "Cozy" image, all on the practice board):
+
+| Logical | Old → new | Effect | Verdict |
+|---|---|---|---|
+| `0x2BB6F` | `24 81 da` → `2c 81 5a` (`lbz r4,0x5b(r1)` → `lwz r4,0x58(r1)`) | `ep.unit_mode` logs status, handle and mode | Works, log-only |
+| `0x265B1` | `38 e7 20` → `38 e7 00` (`ori r7,r7,0x4` → `0x0`) | policy never allows sniff; headset still requests its own | Stable, but the controller rejects the headset's own sniff too |
 
 ## Writing up findings
 

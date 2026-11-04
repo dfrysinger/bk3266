@@ -13,13 +13,17 @@ with a full TX/RX log and `manifest.json`; keep those.
 
 1. **No write without two identical full backups** (`dump` does this) **and the owner's explicit approval of the exact byte diff.**
 2. **Practice board first** when the owner has a spare; never the only unit.
-3. **Change data, not code.** `write` refuses sectors outside the config region unless `--allow-any-sector`.
+3. **Prefer data over code.** `write` refuses sectors outside the config region unless `--allow-any-sector`. A code patch
+   additionally needs the patched bytes disassembled and read back before the owner sees the diff
+   ([references/reverse-engineering.md](references/reverse-engineering.md#patching-code)).
 4. **`write` always starts as a dry run.** It re-reads the whole chip and aborts unless it equals `--expect`, writes only changed 4 KiB sectors, verifies each twice, restores the flash's original protection bits, and re-reads everything.
 5. Never set a timer to 0 to "disable" it until the firmware's comparison has been read. `sleep_timeout=0` fires immediately (the CLI refuses it).
 6. Separate **verified** (read back, traced in code) from **inferred** (field names from the 2018 ToolKit) when reporting to the owner.
 7. **Never leave the chip in download mode.** It stays there until it loses power, and a battery board then looks dead
    (no LEDs, no charge light, button ignored). Device commands reboot it on success. If a headset "won't turn on" after a session,
    run `reboot` before suspecting the flash: an instant LinkCheck ACK with no button press means it's still in download mode.
+8. **Catch the bootloader from a powered-off headset.** Resetting a running one can interrupt its pairing-log write.
+9. **Diagnose from the headset's own log before patching behaviour.** Turn on the debug UART ([references/debug-uart.md](references/debug-uart.md)).
 
 ## Working with the owner
 
@@ -46,7 +50,15 @@ python3 $S patch  original.bin -o candidate.bin --mute-prompt low-battery   # of
 python3 $S write candidate.bin --expect original.bin --port ...            # dry run: shows sectors and bytes
 python3 $S write candidate.bin --expect original.bin --port ... --yes      # after owner approves the diff
 python3 $S reboot --port /dev/cu.usbserial-XXXX                # rescue a chip left in download mode
+python3 $S patch  dump.bin -o debug.bin --set-bits system_flag=0x1        # turn on the firmware's debug UART log
+python3 $S listen --port /dev/cu.usbserial-XXXX --grep 'sniff|unit_mode|disconn'   # read it (stop before flashing)
+python3 $S patch  dump.bin -o code.bin --poke 0x2bb6f=2481da:2c815a      # code patch: old bytes must match
+python3 $S disasm --raw code.bin -o check.asm --start 0x2bb51 --end 0x2bb84   # read the patch back
 ```
+
+`listen` and the device commands can't share the port: stop the listener first. If the pairing log has unstable bits
+(the same `0x7E000`–`0x7EFFF` byte reads differently on different passes), pass `write --ignore-range 0x7e000-0x7f000`. It refuses to
+cover a sector being written.
 
 **The firmware writes its own pairing log (raw `0x7E000`–`0x7EFFF`) every time it runs and connects**, so an older backup
 stops matching and `write` aborts with `device flash != --expect`. That abort is correct. Re-baseline in a single
@@ -65,7 +77,8 @@ handshake `01 E0 FC 02 AA 55`**. Without that handshake the bootloader quits ~0.
 | All prompts quieter | `--set vol_wave=N` | Global; index, not dB. |
 | Different / clearer voice | Replace SBC clips | `prompts` extracts them. Only bank 0 is usually populated, so switching language rarely helps. See [references/flash-format.md](references/flash-format.md). |
 | Low-battery threshold/interval | `lp_threshold`, `lp_pd_threshold`, `lp_interval` | Muting is usually the better fix. |
-| Drops ~30 s after audio stops, reason `0x22` | `--clear-bits feature_flag=0x80000` | **Confirmed fix** on 2021 firmware with an iPhone. The headset refuses sniff instead of ignoring the request. See [references/disconnects.md](references/disconnects.md). |
+| Drops ~30 s after audio stops, reason `0x22` | `--clear-bits feature_flag=0x80000` | **Confirmed fix** on 2021 firmware with an iPhone. Root cause, from the headset's log: its link manager rejects the iPhone's sniff parameters (`0x1E`) without telling the phone. See [references/disconnects.md](references/disconnects.md). |
+| See what the headset is doing | `--set-bits system_flag=0x1`, then `listen` | Debug log at 115200 on the flashing pads. [references/debug-uart.md](references/debug-uart.md) |
 | Reconnect loop behaviour | `disconn_retry_*`, `auto_conn_*`, `bt_flag` | Changes the aftermath, not the cause. |
 
 Field meanings, offsets, units and confidence: [references/config-map.md](references/config-map.md).

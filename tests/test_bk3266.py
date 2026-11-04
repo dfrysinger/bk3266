@@ -127,6 +127,24 @@ class FakeBootloader:
             self.reply(cmd, 0, args[:4])
 
 
+class FakeRunningFirmware(FakeBootloader):
+    """Headset already on with its debug UART enabled: the firmware ACKs LinkCheck and prints
+    log text but never answers the second handshake. After `boot_after` LinkChecks the owner
+    has power-cycled it into the real bootloader."""
+
+    def __init__(self, flash, boot_after=3):
+        super().__init__(flash)
+        self.left = boot_after
+
+    def write(self, data):
+        if self.left > 0:
+            if data.startswith(bk.LINKCHECK):
+                self.left -= 1
+                self.out += bk.LINKCHECK_ACK + b'+++adc:3334(mV),adc_avr:3334(mV)\r\n'
+            return len(data)
+        return super().write(data)
+
+
 def run(argv):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -175,6 +193,22 @@ class PatchTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.patch('--set', 'sleep_timeout=0')
 
+    def test_poke_replaces_matching_bytes_and_fixes_crc(self):
+        logical = bk.strip(synthetic_image())
+        old = logical[0x1000:0x1003]
+        new = bytes(b ^ 0xFF for b in old)
+        a, b = self.patch('--poke', f'0x1000={old.hex()}:{new.hex()}')
+        self.assertEqual(bk.strip(b)[0x1000:0x1003], new)
+        self.assertEqual(bk.crc_extent(b), bk.crc_extent(a))
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        self.assertTrue(all(i // 34 == 0x1000 // 32 for i in diff), 'only that record changes')
+
+    def test_poke_refuses_when_old_bytes_differ(self):
+        logical = bk.strip(synthetic_image())
+        wrong = bytes(b ^ 1 for b in logical[0x1000:0x1002])
+        with self.assertRaises(SystemExit):
+            self.patch('--poke', f'0x1000={wrong.hex()}:0000')
+
 
 class DeviceTests(unittest.TestCase):
     def setUp(self):
@@ -182,10 +216,47 @@ class DeviceTests(unittest.TestCase):
         self.orig = synthetic_image()
         self.fake = FakeBootloader(self.orig)
         self._open = bk.open_port
+        self._settle = bk.REBOOT_SETTLE
+        bk.REBOOT_SETTLE = 0
         bk.open_port = lambda *a, **k: self.fake
 
     def tearDown(self):
         bk.open_port = self._open
+        bk.REBOOT_SETTLE = self._settle
+
+    def mute_candidate(self):
+        src = self.tmp / 'orig.bin'
+        src.write_bytes(self.orig)
+        cand = self.tmp / 'cand.bin'
+        run(['patch', str(src), '-o', str(cand), '--config-base', hex(CFG), '--mute-prompt', 'low-battery'])
+        return src, cand
+
+    def test_connect_waits_out_running_firmware(self):
+        self.fake = FakeRunningFirmware(self.orig)
+        out = run(['ping', '--port', 'fake', '--wait', '5', '--evidence', str(self.tmp)])
+        self.assertIn('firmware is running', out)
+        self.assertIn('85 60', out)
+
+    def test_ignore_range_tolerates_unstable_bits_elsewhere(self):
+        src, cand = self.mute_candidate()
+        flaky = SIZE - 0x100                       # far from the config sector being written
+        self.fake.flash[flaky] ^= 0x04
+        common = ['write', str(cand), '--expect', str(src), '--port', 'fake', '--wait', '2',
+                  '--config-base', hex(CFG), '--yes']
+        with self.assertRaises(IOError):
+            run(common + ['--evidence', str(self.tmp / 'a')])
+        lo = flaky // bk.SECTOR * bk.SECTOR
+        self.fake = FakeBootloader(self.fake.flash)
+        out = run(common + ['--evidence', str(self.tmp / 'b'), '--ignore-range', f'{lo:#x}-{lo + bk.SECTOR:#x}'])
+        self.assertIn('WRITTEN_AND_VERIFIED', out)
+        self.assertIn('ignoring raw', out)
+
+    def test_ignore_range_may_not_cover_written_sector(self):
+        src, cand = self.mute_candidate()
+        sector = bk.raw_of(CFG) // bk.SECTOR * bk.SECTOR
+        with self.assertRaises(SystemExit):
+            run(['write', str(cand), '--expect', str(src), '--port', 'fake', '--config-base', hex(CFG),
+                 '--ignore-range', f'{sector:#x}-{sector + bk.SECTOR + 0x2000:#x}'])
 
     def test_dump_two_identical_passes(self):
         out = run(['dump', '--port', 'fake', '--wait', '2', '--out', str(self.tmp)])
