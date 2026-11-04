@@ -15,6 +15,27 @@ On the firmware analysed so far:
 
 **Test it, don't assume it.** First measure the time from pause to first drop, then capture the reason code.
 
+### What a real capture showed (iPhone + 2021 "Cozy" headband, 2026-11-03)
+
+The headset reports LMP version `0x09` (BT 5.0), manufacturer `0x000E`, subversion `0x1450`. The drop is **not** an oversleep:
+
+```
+09:29:38  CMD  Sniff Mode handle 0x29 max 240ms min 240ms attempt 1 timeout 1   ← iPhone asks for sniff
+          (no Mode Change: the headset never answers)
+09:30:08  EVT  Disconnection Complete handle 0x29 reason 0x22 LMP Response Timeout   ← exactly 30 s later
+09:30:08  EVT  Connection Complete ...                                              ← auto-reconnect
+09:30:42  CMD  Sniff Mode ...  →  Mode Change status 0x24 (LMP PDU not allowed)     ← clean refusal, no drop
+09:31:22  EVT  Mode Change -> sniff 320ms; 100 ms later -> active                   ← headset's own sniff (0x200 slots)
+09:31:37  CMD  Sniff Mode ...   (no answer)
+09:32:07  EVT  Disconnection Complete reason 0x22 LMP Response Timeout
+```
+
+The 30 s is the LMP response timeout, not the idle timer. In code, the link policy written at connection is role-switch
+only (`0xC2 | 1` at `0x2B1AD`), so sniff is **refused** until the idle path (`0x2654C`, gated by `feature_flag & 0x80000`)
+turns policy bit `0x4` on and starts the headset's own sniff entry. Every unanswered request in the capture fell inside that
+window. That's consistent with a collision between phone- and headset-initiated sniff. With the bit cleared, the policy stays
+"refuse", and refusal is proven to work (the `0x24` above). That makes `--clear-bits feature_flag=0x80000` the first fix to try.
+
 ## Step 1: capture the HCI disconnect reason (no firmware change)
 
 ### iPhone

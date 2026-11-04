@@ -171,6 +171,10 @@ LINKCHECK_ACK = bytes.fromhex('04 0e 05 01 e0 fc 01 00')
 # after the first 4 KiB read. Found in ToolKit startup (VA 0x443CE0 -> 0x4042C0).
 HELLO = bytes.fromhex('01 e0 fc 02 aa 55')
 HELLO_ACK = bytes.fromhex('04 0e 05 01 e0 fc aa 55')
+# Leaves download mode and starts the application. The ToolKit sends it 3x after a write.
+# Without it the chip stays in download mode for as long as it has power (battery boards: until flat),
+# which looks like a dead headset: no LEDs, no charge light, power button ignored.
+REBOOT = bytes.fromhex('01 e0 fc 02 0e a5')
 EXT_TX = bytes.fromhex('01 e0 fc ff f4')
 EXT_RX = bytes.fromhex('04 0e ff 01 e0 fc f4')
 CMD_WRITE, CMD_READ, CMD_ERASE, CMD_RDSR, CMD_WRSR, CMD_SPI = 0x07, 0x09, 0x0B, 0x0C, 0x0D, 0x0E
@@ -299,6 +303,12 @@ class Link:
         if self.read(address) != data or self.read(address) != data:
             raise IOError(f'sector {address:#x} readback mismatch')
 
+    def reboot(self) -> None:
+        for _ in range(3):
+            self.send(REBOOT)
+            time.sleep(0.1)
+        self.pump()
+
     def drain(self) -> None:
         self.buffer.clear()
         quiet = time.monotonic()
@@ -341,16 +351,30 @@ def sha(data: bytes) -> str:
 # --------------------------------------------------------------------------
 # Device commands
 # --------------------------------------------------------------------------
+def finish(link: 'Link', a, ok: bool) -> None:
+    """End a session. Reboot into the application unless asked not to or a write failed mid-way."""
+    try:
+        if ok and not a.no_reboot:
+            link.reboot()
+            print('Rebooted the chip out of download mode.', flush=True)
+        elif ok:
+            print('Left in download mode (--no-reboot). Run `reboot` or disconnect power when done.', flush=True)
+    finally:
+        link.log.close()
+
+
 def cmd_ping(a):
     ev = evidence_dir(a.evidence, 'ping')
     with open_port(a.port) as port:
         link = Link(port, ev)
+        ok = False
         try:
             link.connect(a.wait, a.say)
             ident = link.jedec()
             sr = link.status()
+            ok = True
         finally:
-            link.log.close()
+            finish(link, a, ok)
     size = 1 << ident[2]
     result = dict(jedec=ident.hex(' '), capacity_bytes=size, status_sr1_sr2=sr.hex(' '))
     (ev / 'manifest.json').write_text(json.dumps(result, indent=2))
@@ -363,6 +387,7 @@ def cmd_dump(a):
     with open_port(a.port) as port:
         link = Link(port, ev)
         images = []
+        ok = False
         try:
             link.connect(a.wait, a.say)
             ident = link.jedec()
@@ -375,8 +400,9 @@ def cmd_dump(a):
                 images.append(img)
                 manifest['dumps'].append(dict(file=f'flash-dump-{n}.bin', sha256=sha(img)))
                 (ev / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+            ok = True
         finally:
-            link.log.close()
+            finish(link, a, ok)
     manifest['identical'] = len({sha(i) for i in images}) == 1
     (ev / 'manifest.json').write_text(json.dumps(manifest, indent=2))
     say(a.say, 'Backup complete.' if manifest['identical'] else 'Backups differ. Do not write.')
@@ -424,6 +450,7 @@ def cmd_write(a):
         original_sr = None
         unprotected = False
         current_sector = None
+        ok = False
         try:
             link.connect(a.wait, a.say)
             ident = link.jedec()
@@ -458,6 +485,7 @@ def cmd_write(a):
                 raise IOError('post-write full image != candidate')
             state('WRITTEN_AND_VERIFIED', after_sha256=sha(after), final_sr=link.status().hex(' '))
             say(a.say, 'Write verified.')
+            ok = True
         except BaseException as exc:
             state('FAILED', error=repr(exc))
             if current_sector is not None:
@@ -477,6 +505,26 @@ def cmd_write(a):
                 except BaseException as exc:
                     manifest['protection_restore_error'] = repr(exc)
                 (ev / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+            if not ok:
+                print('Write did not complete: chip left in download mode so you can retry or restore.', flush=True)
+            finish(link, a, ok)
+
+
+def cmd_reboot(a):
+    ev = evidence_dir(a.evidence, 'reboot')
+    with open_port(a.port) as port:
+        link = Link(port, ev)
+        try:
+            port.reset_input_buffer()
+            link.handshake(LINKCHECK, LINKCHECK_ACK, a.wait)
+            link.reboot()
+            link.buffer.clear()
+            try:
+                link.handshake(LINKCHECK, LINKCHECK_ACK, 1.0, every=0.1)
+                raise SystemExit('chip still answers in download mode after reboot')
+            except TimeoutError:
+                print('Rebooted: chip no longer in download mode. Power it on normally.')
+        finally:
             link.log.close()
 
 
@@ -717,6 +765,8 @@ def main(argv=None):
         p.add_argument('--port', required=True, help='serial device, e.g. /dev/cu.usbserial-XXXX or COM5')
         p.add_argument('--wait', type=float, default=300, help='seconds to wait for the power-button catch')
         p.add_argument('--say', action='store_true', help='speak cues (macOS)')
+        p.add_argument('--no-reboot', action='store_true',
+                       help='stay in download mode afterwards (default: reboot into the application)')
 
     def cfgbase(p):
         p.add_argument('--config-base', type=parse_int, help='logical config address override')
@@ -725,6 +775,12 @@ def main(argv=None):
     device(p)
     p.add_argument('--evidence', type=Path, default=Path('bk3266-evidence'))
     p.set_defaults(fn=cmd_ping)
+
+    p = sub.add_parser('reboot', help='leave download mode (fixes a "dead" headset left in the bootloader)')
+    p.add_argument('--port', required=True)
+    p.add_argument('--wait', type=float, default=5, help='seconds to look for a chip in download mode')
+    p.add_argument('--evidence', type=Path, default=Path('bk3266-evidence'))
+    p.set_defaults(fn=cmd_reboot)
 
     p = sub.add_parser('dump', help='full flash backup, N passes, require identical')
     device(p)

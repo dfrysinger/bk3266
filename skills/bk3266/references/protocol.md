@@ -46,12 +46,24 @@ dispatches Puya ID `0x136085` to `0x44B480`, which does the same. Reads work whi
 registers. For other flash vendors, read the datasheet's BP/CMP semantics before choosing an unlock value
 (`--unprotect-value`, `--unprotect-value-confirmed`).
 
+## Leaving download mode: reboot `01 E0 FC 02 0E A5`
+
+**Once the AA/55 handshake has been done, the chip stays in download mode for as long as it has power.** On a board
+with a soldered battery, that means until the battery runs flat. While it's stuck there, the headset looks dead: no LEDs,
+no charge light, and the power button does nothing. A LinkCheck still gets an instant ACK **without** the button being
+pressed, which is how you tell.
+
+The ToolKit sends `01 E0 FC 02 0E A5` three times after a write (builder `0x402270`, caller `0x449DBB`). Verified on hardware
+(2026-11-03): after it, the chip stopped answering LinkCheck, a single `00` byte appeared on the line, and the headset
+then powered on normally. It gets no ACK. `bk3266.py` sends it at the end of every successful `ping`, `dump` and `write`,
+but **not** after a failed write, so you can retry or restore. Use `--no-reboot` to stay in download mode. The standalone
+`reboot` command rescues a chip that was left there.
+
 ## Other commands seen in the ToolKit (don't send these casually)
 
 | Frame | Where | Status |
 |---|---|---|
 | `01 E0 FC 06 0F <baud:u32 LE> <delay>` | builder `0x402110`, wrapper `0x404350` | Baud change (115200, 1M or 2M). Not needed. |
-| `01 E0 FC 02 0E A5` | builder `0x402270`, sent 3× after writes | Probably a reboot or reset. Unverified. |
 | `01 E0 FC 05 FE 95 27 95 27` | builder `0x4022B0` | Sent on failed connects. Unknown. |
 
 ## Practical timing

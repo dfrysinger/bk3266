@@ -50,6 +50,7 @@ class FakeBootloader:
         self.out = bytearray()
         self.inbuf = bytearray()
         self.hello = False
+        self.reboots = 0
         self.erases = []
         self.writes = []
 
@@ -74,7 +75,13 @@ class FakeBootloader:
     def write(self, data):
         self.inbuf += data
         while True:
-            if self.inbuf.startswith(bk.LINKCHECK):
+            if self.inbuf.startswith(bk.REBOOT):
+                del self.inbuf[:6]
+                self.reboots += 1
+                self.hello = False
+            elif self.reboots and self.inbuf:
+                self.inbuf.clear()          # application running: bootloader no longer answers
+            elif self.inbuf.startswith(bk.LINKCHECK):
                 del self.inbuf[:5]
                 self.out += bk.LINKCHECK_ACK
             elif self.inbuf.startswith(bk.HELLO):
@@ -185,6 +192,26 @@ class DeviceTests(unittest.TestCase):
         self.assertIn('"identical": true', out)
         dumps = sorted(self.tmp.glob('dump-*/flash-dump-*.bin'))
         self.assertEqual([d.read_bytes() for d in dumps], [self.orig, self.orig])
+        self.assertTrue(self.fake.reboots, 'dump must reboot the chip out of download mode')
+
+    def test_no_reboot_flag_leaves_download_mode(self):
+        run(['ping', '--port', 'fake', '--wait', '2', '--evidence', str(self.tmp), '--no-reboot'])
+        self.assertEqual(self.fake.reboots, 0)
+
+    def test_reboot_command(self):
+        self.assertIn('Rebooted', run(['reboot', '--port', 'fake', '--wait', '2', '--evidence', str(self.tmp)]))
+        self.assertTrue(self.fake.reboots)
+
+    def test_failed_write_stays_in_download_mode(self):
+        src = self.tmp / 'orig.bin'
+        src.write_bytes(self.orig)
+        cand = self.tmp / 'cand.bin'
+        run(['patch', str(src), '-o', str(cand), '--config-base', hex(CFG), '--mute-prompt', 'low-battery'])
+        self.fake.flash[0] ^= 0xFF
+        with self.assertRaises(IOError):
+            run(['write', str(cand), '--expect', str(src), '--port', 'fake', '--wait', '2',
+                 '--config-base', hex(CFG), '--evidence', str(self.tmp), '--yes'])
+        self.assertEqual(self.fake.reboots, 0)
 
     def test_write_requires_yes_then_writes_and_restores_protection(self):
         src = self.tmp / 'orig.bin'
@@ -200,6 +227,7 @@ class DeviceTests(unittest.TestCase):
         self.assertEqual(bytes(self.fake.flash), cand.read_bytes())
         self.assertEqual(bytes(self.fake.sr), b'\x00\x40')
         self.assertEqual(len(self.fake.erases), 1)
+        self.assertEqual(self.fake.reboots, 3, 'reboot sent 3x, as the ToolKit does, after a verified write')
 
     def test_write_aborts_if_device_differs_from_expect(self):
         src = self.tmp / 'orig.bin'

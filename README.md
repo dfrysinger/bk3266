@@ -55,6 +55,17 @@ python3 skills/bk3266/scripts/bk3266.py ping --port /dev/cu.usbserial-XXXX --say
 ```
 `ping` prints the flash JEDEC ID, the capacity, and the flash write-protection status.
 
+### "My BK3266 headphones won't turn on after flashing": leaving download mode
+
+Once the second handshake is done, **the chip stays in download mode until it loses power**. With a soldered battery, the
+headset then looks dead: no LEDs, no charge light, and the power button does nothing. The fix is the reboot frame
+**`01 E0 FC 02 0E A5`**, which the Beken ToolKit sends 3× after a write. `bk3266.py` sends it at the end of every successful
+session. To rescue a stuck chip:
+```sh
+python3 skills/bk3266/scripts/bk3266.py reboot --port /dev/cu.usbserial-XXXX
+```
+Tell-tale sign: the chip ACKs LinkCheck instantly **without** the power button being pressed.
+
 ## 3. How to download (dump) the BK3266 firmware
 
 ```sh
@@ -75,6 +86,8 @@ Extended frame: `01 E0 FC FF F4 <len:u16 LE> <cmd> <args…>`. Reply: `04 0E FF 
 | `0C` | Read flash status register | `05` (SR1) / `35` (SR2) | `reg, value` |
 | `0D` | Write flash status registers | `01 SR1 SR2` | echo |
 | `0E` | SPI passthrough (e.g. JEDEC `9F 00 00 00`) | 4 bytes | 4 bytes, first one a dummy byte |
+
+Short frames: `01 E0 FC 01 00` LinkCheck, `01 E0 FC 02 AA 55` stay-in-download-mode handshake, `01 E0 FC 02 0E A5` **reboot** (no ACK).
 
 Example: a full read of block 0 is `01 E0 FC FF F4 05 00 09 00 00 00 00`.
 

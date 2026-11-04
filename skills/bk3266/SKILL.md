@@ -17,6 +17,9 @@ with a full TX/RX log and `manifest.json`; keep those.
 4. **`write` always starts as a dry run.** It re-reads the whole chip and aborts unless it equals `--expect`, writes only changed 4 KiB sectors, verifies each twice, restores the flash's original protection bits, and re-reads everything.
 5. Never set a timer to 0 to "disable" it until the firmware's comparison has been read. `sleep_timeout=0` fires immediately (the CLI refuses it).
 6. Separate **verified** (read back, traced in code) from **inferred** (field names from the 2018 ToolKit) when reporting to the owner.
+7. **Never leave the chip in download mode.** It stays there until it loses power, and a battery board then looks dead
+   (no LEDs, no charge light, button ignored). Device commands reboot it on success. If a headset "won't turn on" after a session,
+   run `reboot` before suspecting the flash: an instant LinkCheck ACK with no button press means it's still in download mode.
 
 ## Working with the owner
 
@@ -42,6 +45,7 @@ python3 $S config backups/dump-*/flash-dump-1.bin              # every known set
 python3 $S patch  original.bin -o candidate.bin --mute-prompt low-battery   # offline, CRCs fixed, prints diff
 python3 $S write candidate.bin --expect original.bin --port ...            # dry run: shows sectors and bytes
 python3 $S write candidate.bin --expect original.bin --port ... --yes      # after owner approves the diff
+python3 $S reboot --port /dev/cu.usbserial-XXXX                # rescue a chip left in download mode
 ```
 
 To catch the bootloader, the host spams LinkCheck while the owner **presses and holds power**. Then it sends the **second
