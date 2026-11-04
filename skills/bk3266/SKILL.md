@@ -48,6 +48,11 @@ python3 $S write candidate.bin --expect original.bin --port ... --yes      # aft
 python3 $S reboot --port /dev/cu.usbserial-XXXX                # rescue a chip left in download mode
 ```
 
+**The firmware writes its own pairing log (raw `0x7E000`–`0x7EFFF`) every time it runs and connects**, so an older backup
+stops matching and `write` aborts with `device flash != --expect`. That abort is correct. Re-baseline in a single
+download-mode session: `dump --no-reboot`, `patch` that fresh dump, then `write` against it. The chip is still in download
+mode, so the firmware can't change anything in between.
+
 To catch the bootloader, the host spams LinkCheck while the owner **presses and holds power**. Then it sends the **second
 handshake `01 E0 FC 02 AA 55`**. Without that handshake the bootloader quits ~0.5 s after the first read, which is the classic
 "I can only ever read one block" failure. Protocol details: [references/protocol.md](references/protocol.md).
