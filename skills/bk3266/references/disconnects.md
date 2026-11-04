@@ -52,6 +52,31 @@ After one clean refusal, iOS stops asking and keeps the link active. The cost is
 During A2DP streaming the firmware refuses sniff anyway, so all-night audio is unaffected. A multi-night battery
 comparison is still pending.
 
+### Fixed properly: the headset now accepts the phone's sniff (2026-11-04)
+
+The bug is in the controller's LMP_sniff_req handler (logical `0x3D217`, LMP dispatch table entry 23 at `0x56880 + 23*4`).
+It only accepts sniff intervals of 320–400 ms (`0x200`–`0x280` slots) and attempt ≥ 4. For anything else it
+**counter-proposes, but clamps the interval to a placeholder minimum of 4 slots** (`0x3D3CF`), giving `Tsniff=4, attempt=4`,
+which breaks the spec's `attempt ≤ Tsniff/2` rule. The iPhone rejects that with `0x1E`, and its own request is never answered,
+so 30 s later the link drops with `0x22`.
+
+Apple's Accessory Design Guidelines (§56.3) say accessories shall "accept sniff mode requests and support valid parameters"
+and, when the Apple device requests sniff, "accept the request and parameters without negotiation". So the fix is to accept:
+
+| Patch | Logical | Old → new | Effect |
+|---|---|---|---|
+| B1 | `0x3D2A8` | `d1 f0 5b 00` → `d1 c0 5b 00` (`bgtui r5,0x3` → `0x0`) | accept sniff attempt ≥ 1 (was: ≤ 3 forced to 4, then negotiation) |
+| B2 | `0x3D3BF` | `d8 c6 00 7f` → `d8 c6 17 ff` (`addi r6,r6,-0x200` → `-0x18`) | interval window starts at 15 ms … |
+| B3 | `0x3D3C6` | `9f 46 01 00 00 00` → `9f 46 16 40 00 00` (`sfleui r6,0x80` → `0x268`) | … and still ends at 400 ms |
+| C | `0x3D426` | `d1 c8 77 80` → `0d e0 00 10` (`bgtui r7,0x4,0x3d444` → `bt.j 0x3d444; bt.nop`) | never counter-propose: anything still unacceptable gets the handler's existing clean rejection (`0x20`) |
+
+Result, 2026-11-04 (stock config with sniff on, debug UART on): the iPhone asked for 240 ms / attempt 1, and the headset
+**accepted in 13 ms**. The link then stayed in sniff for 9½ minutes with no drops. Pressing play returned it to active in 150 ms and
+audio worked. One connection for the whole test. The chip keeps up at 240 ms with attempt 1 (no `0x08` supervision timeouts).
+
+Still open: battery comparison against the config-only fix, multi-night use, Android phones (other parameter sets), and
+replacing C with a *valid* counter-proposal (clamp into 15–400 ms) for requests outside the window.
+
 ### Root cause, from the headset's own log (2026-11-04)
 
 With the [debug UART](debug-uart.md) on and the Mode Change log line widened to print the status, the phone trace and
@@ -67,9 +92,9 @@ the headset log line up to the second (sniff re-enabled, i.e. stock behaviour):
 | 14:17:32 | | `enter sniff` (own retry), no result |
 | 14:17:47 | Disconnection Complete `0x22` | `disconn_compl … 0x22` |
 
-**When its policy allows sniff, the headset's link manager judges the iPhone's sniff parameters invalid, reports
-`0x1E` to its own host, and never sends LMP_not_accepted back over the air.** The phone waits out the 30 s LMP response
-timeout and drops the link, and the headset's own retries go nowhere in the meantime. Refusal (`0x24`) is
+**When its policy allows sniff, the headset's link manager answers the iPhone's request with an invalid counter-proposal
+(see the section above). The iPhone rejects it with `0x1E`, and the headset passes that up to its own host.** The iPhone's own request is never
+answered, so it waits out the 30 s LMP response timeout and drops the link. The headset's own retries go nowhere in the meantime. Refusal (`0x24`) is
 answered properly, and sniff that the headset initiates (320–400 ms, attempt 4, timeout 4) works in both directions.
 The bug is in the controller's handling of a *remote* sniff request it considers invalid. The host stack only logs the
 symptom. The first connection of the earlier capture showed that the headset doesn't need to have initiated sniff for this to happen.
@@ -82,10 +107,12 @@ symptom. The first connection of the earlier capture showed that the headset doe
 | Stock + debug UART | `0x1E` on phone-initiated sniff, then `0x22` | Root cause (above) |
 | Policy never allows sniff, but headset still initiates its own (`0x265B1` `ori r7,r7,0x4` → `0x0`, `--poke 0x265b1=38e720:38e700`) | Stable (6.5 min, one link), phone refused once. **But all 10 headset `enter sniff` attempts were silently rejected**: no Mode Change | The controller enforces local link policy on locally initiated sniff too. Same outcome as the fix. |
 | Moving `sleep_timeout` (e.g. 45 s or 20 s) | Not run | Only moves when the "allow" window opens. A shorter timer makes it worse. |
+| Accept the phone's parameters (B) + never counter-propose (C), above | Sniff at 240 ms for 9½ min, no drops, resumes audio in 150 ms | **Proper fix**: low power and a stable link |
 
-Paths still open toward "sniff with no drops": toggle the policy around the headset's own sniff entry (allow → Sniff Mode
-→ refuse once in sniff), or fix the link manager so that it answers LMP_not_accepted (or accepts 240 ms). Both are code patches.
-Find the link manager's sniff_req handler by searching for where it produces `0x1E`.
+The link manager runs from flash (it sets LMP version 9 / subversion `0x1450` / manufacturer `0x000E` at `0x3C517`), so it can be patched.
+Its LMP handlers are reached through a table of function pointers indexed by opcode (logical `0x56880`; `0x32313` = unsupported).
+The dispatcher (`0xA3AA`) sends LMP_not_accepted with whatever non-zero status a handler returns. The HCI Sniff Mode handler
+(`0x3CB4F`) enforces the local link policy (`0x1D4(link) & 0x4`, else `0x0C`), which is why "refuse the phone, sniff ourselves" failed.
 
 ### Capture hygiene
 

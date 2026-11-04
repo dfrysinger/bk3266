@@ -193,11 +193,14 @@ Details: [debug-uart.md](skills/bk3266/references/debug-uart.md).
 **Diagnosed and fixed on real hardware (iPhone and a BK3266 sleep headband):**
 
 - **Cause:** about 30 s after audio stops, the firmware's idle timer (`sleep_timeout`) switches the link policy to allow Bluetooth
-  **sniff mode**. When the iPhone then asks for sniff (240 ms, attempt 1, timeout 1), the headset's link manager judges the
-  parameters invalid. Its own debug log shows Mode Change status **`0x1E` Invalid LMP Parameters**, but it **never sends a
-  reply to the phone**. Exactly 30 s later the phone drops the link with HCI reason **`0x22` LMP Response Timeout**. Auto-reconnect
-  turns that into a "disconnected… connected…" loop. Sniff that the headset starts itself (320 ms) works fine.
-- **Fix:** clear one config bit, `feature_flag` `0x80000`. The headset then refuses sniff straight away (`status 0x24`),
+  **sniff mode**. When the iPhone then asks for sniff (240 ms, attempt 1, timeout 1), the headset's link manager, which only accepts
+  320–400 ms with attempt ≥ 4, **counter-proposes an invalid 4-slot interval**. The iPhone rejects that (`0x1E`, visible in the
+  headset's debug log), and its own request is never answered. Exactly 30 s later the phone drops the link with HCI reason **`0x22`
+  LMP Response Timeout**. Auto-reconnect turns that into a "disconnected… connected…" loop.
+- **Proper fix (keeps power saving):** patch the link manager to accept the phone's parameters, as Apple's accessory
+  guidelines require, and never send the bad counter-proposal. That's 4 instructions on the 2021 build. Verified: 240 ms sniff for
+  9½ minutes, no drops. See [disconnects.md](skills/bk3266/references/disconnects.md#fixed-properly-the-headset-now-accepts-the-phones-sniff-2026-11-04).
+- **Simple fix (config only):** clear one config bit, `feature_flag` `0x80000`. The headset then refuses sniff straight away (`status 0x24`),
   iOS stops asking, and the link stays up. In testing: 20 minutes idle, zero drops.
   ```sh
   python3 $S dump  --port /dev/cu.usbserial-XXXX --no-reboot --out backups      # fresh baseline, stay in download mode

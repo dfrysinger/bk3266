@@ -78,6 +78,7 @@ handshake `01 E0 FC 02 AA 55`**. Without that handshake the bootloader quits ~0.
 | Different / clearer voice | Replace SBC clips | `prompts` extracts them. Only bank 0 is usually populated, so switching language rarely helps. See [references/flash-format.md](references/flash-format.md). |
 | Low-battery threshold/interval | `lp_threshold`, `lp_pd_threshold`, `lp_interval` | Muting is usually the better fix. |
 | Drops ~30 s after audio stops, reason `0x22` | `--clear-bits feature_flag=0x80000` | **Confirmed fix** on 2021 firmware with an iPhone. Root cause, from the headset's log: its link manager rejects the iPhone's sniff parameters (`0x1E`) without telling the phone. See [references/disconnects.md](references/disconnects.md). |
+| Drops fixed **and** keep idle power saving | 4 code patches in the link manager's sniff_req handler (accept the phone's parameters, never send a bad counter-proposal) | Verified with an iPhone: 240 ms sniff for 9½ min, no drops. Recipe and addresses (2021 build): [references/disconnects.md](references/disconnects.md). Other builds: find the handler via the LMP dispatch table ([references/reverse-engineering.md](references/reverse-engineering.md)). |
 | See what the headset is doing | `--set-bits system_flag=0x1`, then `listen` | Debug log at 115200 on the flashing pads. [references/debug-uart.md](references/debug-uart.md) |
 | Reconnect loop behaviour | `disconn_retry_*`, `auto_conn_*`, `bt_flag` | Changes the aftermath, not the cause. |
 

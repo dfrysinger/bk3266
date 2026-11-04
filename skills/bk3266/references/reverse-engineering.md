@@ -79,7 +79,29 @@ Patches made so far (2021 "Cozy" image, all on the practice board):
 | Logical | Old → new | Effect | Verdict |
 |---|---|---|---|
 | `0x2BB6F` | `24 81 da` → `2c 81 5a` (`lbz r4,0x5b(r1)` → `lwz r4,0x58(r1)`) | `ep.unit_mode` logs status, handle and mode | Works, log-only |
-| `0x265B1` | `38 e7 20` → `38 e7 00` (`ori r7,r7,0x4` → `0x0`) | policy never allows sniff; headset still requests its own | Stable, but the controller rejects the headset's own sniff too |
+| `0x265B1` | `38 e7 20` → `38 e7 00` (`ori r7,r7,0x4` → `0x0`) | policy never allows sniff; headset still requests its own | Stable, but the controller rejects the headset's own sniff too (reverted) |
+| `0x3D2A8`, `0x3D3BF`, `0x3D3C6`, `0x3D426` | see [disconnects.md](disconnects.md#fixed-properly-the-headset-now-accepts-the-phones-sniff-2026-11-04) | LM accepts the phone's sniff (15–400 ms, attempt ≥ 1); never counter-proposes | **Works**: 240 ms sniff, no drops |
+
+### The link manager (controller) is in flash too
+
+| Address | What |
+|---|---|
+| `0x56880` | LMP opcode dispatch table (4-byte handler pointers; `0x32313` = unsupported). Entry 23 = sniff_req, 43 = SCO_link_req |
+| `0xA3AA` | dispatcher: calls the handler; a non-zero return is sent back as LMP_not_accepted (`0x236AB`) |
+| `0x3D217` | LMP_sniff_req handler (accept / counter-propose via `0xD0D0` / reject `0x20` at `0x3D444`) |
+| `0x3CB4F` | HCI Sniff Mode command handler (checks link policy `0x1D4 & 4`, else `0x0C`) |
+| `0x3C517` | controller version setup: LMP 9, subversion `0x1450`, manufacturer `0x000E` |
+
+Finding LMP handlers: search the logical image for a handler address stored as a little-endian 32-bit word. That lands in the
+dispatch table, and the table index is the LMP opcode.
+
+### Assembling instead of hand-encoding
+
+pyba2 can assemble (`isa.instructions.Instruction.lower(text, addr).encode()`). First re-assemble the *existing* instruction
+and check it matches byte for byte. Pass each instruction's real address, because branches are PC-relative. The
+assembler may choose a shorter form (`bg.j` came out as 2-byte `bt.j`; `addi -0x18` as 3-byte `bn.addi`). Pad with
+`bt.nop` (`00 10`), or keep the long form by editing the immediate in the original encoding: the 16-bit immediate of
+`bg.addi` is bit-reversed (`-0x200` → `00 7f`, `-0x18` → `17 ff`). Decode every result before using it.
 
 ## Writing up findings
 
