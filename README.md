@@ -197,9 +197,10 @@ Details: [debug-uart.md](skills/bk3266/references/debug-uart.md).
   320–400 ms with attempt ≥ 4, **counter-proposes an invalid 4-slot interval**. The iPhone rejects that (`0x1E`, visible in the
   headset's debug log), and its own request is never answered. Exactly 30 s later the phone drops the link with HCI reason **`0x22`
   LMP Response Timeout**. Auto-reconnect turns that into a "disconnected… connected…" loop.
-- **Proper fix (keeps power saving):** patch the link manager to accept the phone's parameters, as Apple's accessory
-  guidelines require, and never send the bad counter-proposal. That's 4 instructions on the 2021 build. Verified: 240 ms sniff for
-  9½ minutes, no drops. See [disconnects.md](skills/bk3266/references/disconnects.md#fixed-properly-the-headset-now-accepts-the-phones-sniff-2026-11-04).
+- **Proper fix (keeps power saving):** patch the link manager to accept the phone's parameters (15–400 ms, attempt ≥ 1), as
+  Apple's accessory guidelines require. Anything outside that range gets a *valid* counter-proposal, and the stock clean refusal
+  follows after 4 rounds. That's one instruction plus a rewritten 39-byte clamp on the 2021 build. Verified with an iPhone: accepted every time,
+  minutes-long sniff, no drops, and a valid counter-proposal is declined cleanly by iOS instead of hanging the link. See [disconnects.md](skills/bk3266/references/disconnects.md#fixed-properly-the-headset-now-accepts-the-phones-sniff-2026-11-04).
 - **Simple fix (config only):** clear one config bit, `feature_flag` `0x80000`. The headset then refuses sniff straight away (`status 0x24`),
   iOS stops asking, and the link stays up. In testing: 20 minutes idle, zero drops.
   ```sh

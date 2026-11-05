@@ -61,21 +61,46 @@ which breaks the spec's `attempt ≤ Tsniff/2` rule. The iPhone rejects that wit
 so 30 s later the link drops with `0x22`.
 
 Apple's Accessory Design Guidelines (§56.3) say accessories shall "accept sniff mode requests and support valid parameters"
-and, when the Apple device requests sniff, "accept the request and parameters without negotiation". So the fix is to accept:
+and, when the Apple device requests sniff, "accept the request and parameters without negotiation". The Bluetooth spec
+allows three responses: accept, a *valid* counter-proposal (LMP_sniff_req with new parameters), or LMP_not_accepted.
+
+**Final patch set (2021 "Cozy" build).** The handler now does this: accept anything from 15–400 ms with attempt ≥ 1; otherwise
+counter-propose a valid interval clamped into that window; after 4 rounds, refuse cleanly (`0x20`, stock code).
 
 | Patch | Logical | Old → new | Effect |
 |---|---|---|---|
-| B1 | `0x3D2A8` | `d1 f0 5b 00` → `d1 c0 5b 00` (`bgtui r5,0x3` → `0x0`) | accept sniff attempt ≥ 1 (was: ≤ 3 forced to 4, then negotiation) |
-| B2 | `0x3D3BF` | `d8 c6 00 7f` → `d8 c6 17 ff` (`addi r6,r6,-0x200` → `-0x18`) | interval window starts at 15 ms … |
-| B3 | `0x3D3C6` | `9f 46 01 00 00 00` → `9f 46 16 40 00 00` (`sfleui r6,0x80` → `0x268`) | … and still ends at 400 ms |
-| C | `0x3D426` | `d1 c8 77 80` → `0d e0 00 10` (`bgtui r7,0x4,0x3d444` → `bt.j 0x3d444; bt.nop`) | never counter-propose: anything still unacceptable gets the handler's existing clean rejection (`0x20`) |
+| B | `0x3D2A8` | `d1 f0 5b 00` → `d1 c0 5b 00` (`bgtui r5,0x3` → `0x0`) | accept sniff attempt ≥ 1 (was: ≤ 3 forced to 4, then negotiation) |
+| A | `0x3D3AD`–`0x3D3D3` (39 bytes) | `28eab328cad3d38c790028ea53016028cad3d8c6007f3e06329f460100000047210028ea530160` → `28cad3d8e018003de73064e732d8a001403de72864e53a28ea533d4730656b0238a50000100010` | replaces "raise to link minimum" plus the buggy window check with one clamp: `T' = min(max(T, 0x18), 0x280)`; if `T' ≠ T`, mark "needs counter-proposal". Same size, nothing else moves |
 
-Result, 2026-11-04 (stock config with sniff on, debug UART on): the iPhone asked for 240 ms / attempt 1, and the headset
-**accepted in 13 ms**. The link then stayed in sniff for 9½ minutes with no drops. Pressing play returned it to active in 150 ms and
-audio worked. One connection for the whole test. The chip keeps up at 240 ms with attempt 1 (no `0x08` supervision timeouts).
+The A block, as assembled:
+```
+3d3ad  lhz  r6,0xca(r10)      ; T = requested Tsniff
+3d3b0  addi r7,r0,0x18        ; LO = 24 slots (15 ms)
+3d3b4  sfgtu r7,r6 / cmov r7,r7,r6     ; r7 = max(T, LO)
+3d3ba  addi r5,r0,0x280       ; HI = 640 slots (400 ms)
+3d3be  sfgtu r7,r5 / cmov r7,r5,r7     ; r7 = min(r7, HI)
+3d3c4  sh   0xca(r10),r7      ; store
+3d3c7  sfeq r7,r6 / cmov r11,r11,r0    ; changed → acceptable = 0 → counter-propose r7
+3d3cd  ori r5,r5,0 ; nop ; nop          ; padding to 0x3D3D4
+```
+It uses only instructions whose meaning is confirmed by the handler's own code (`sfgtu`+`cmov` at `0x3D39B`/`0x3D3A1`).
+pyba2 marks `bn.max`/`bn.min` as unknown, so they're avoided. Design choice: the link's own minimum (`0xCC`) is no longer applied here,
+because the window's LO covers it. The link-maximum clamp just before it is unchanged.
 
-Still open: battery comparison against the config-only fix, multi-night use, Android phones (other parameter sets), and
-replacing C with a *valid* counter-proposal (clamp into 15–400 ms) for requests outside the window.
+**Results, 2026-11-04, iPhone, stock config with sniff on:**
+
+| Firmware | What the iPhone's 240 ms / attempt 1 request got | Link |
+|---|---|---|
+| stock | invalid counter-proposal (4 slots) → phone rejects `0x1E`, its own request hangs | drops after 30 s (`0x22`), loop |
+| B + C (accept / refuse, intermediate) | **accepted in 13 ms**, sniff 567 of 608 s (93%), one 9½-min stretch | stable, play resumes in 150 ms |
+| A only, stock 320–400 ms window (test) | **valid** counter-proposal 320 ms / attempt 4 → iOS declines with `0x20` in 9 ms, transaction closes cleanly | stable. The headset's own 320 ms sniff still works. iOS doesn't take counter-proposals |
+| **A + B (final)** | **accepted in 14 ms**, every time (5/5); sniff 289 of 392 s (74%), one 4 min 22 s stretch | stable, play resumes immediately |
+
+Short sniff periods early in a run end at the radio layer, with no command from either host, so they aren't firmware-driven.
+For an accepted request, B+C and A+B execute identical code.
+
+Not yet exercised: the 4-round give-up path (an iPhone never counter-proposes back), Android phones, battery comparison
+against the config-only fix, and multi-night use.
 
 ### Root cause, from the headset's own log (2026-11-04)
 

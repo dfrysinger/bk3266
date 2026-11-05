@@ -80,7 +80,12 @@ Patches made so far (2021 "Cozy" image, all on the practice board):
 |---|---|---|---|
 | `0x2BB6F` | `24 81 da` → `2c 81 5a` (`lbz r4,0x5b(r1)` → `lwz r4,0x58(r1)`) | `ep.unit_mode` logs status, handle and mode | Works, log-only |
 | `0x265B1` | `38 e7 20` → `38 e7 00` (`ori r7,r7,0x4` → `0x0`) | policy never allows sniff; headset still requests its own | Stable, but the controller rejects the headset's own sniff too (reverted) |
-| `0x3D2A8`, `0x3D3BF`, `0x3D3C6`, `0x3D426` | see [disconnects.md](disconnects.md#fixed-properly-the-headset-now-accepts-the-phones-sniff-2026-11-04) | LM accepts the phone's sniff (15–400 ms, attempt ≥ 1); never counter-proposes | **Works**: 240 ms sniff, no drops |
+| `0x3D2A8`, `0x3D3BF`, `0x3D3C6`, `0x3D426` | (intermediate B+C) | LM accepts the phone's sniff (15–400 ms, attempt ≥ 1); never counter-proposes | Worked; superseded |
+| `0x3D2A8` + 39-byte block `0x3D3AD` | see [disconnects.md](disconnects.md#fixed-properly-the-headset-now-accepts-the-phones-sniff-2026-11-04) | **final**: accept 15–400 ms / attempt ≥ 1, else a *valid* counter-proposal clamped into the window, else stock refusal | **Works**: iPhone accepted 5/5, no drops; a valid counter is declined cleanly by iOS |
+
+Rewriting a block in place (A) is safer than a code cave on this image. The zero runs are either inside data tables
+(`0x566D5`, just before the `BK326601` template read at `0x394BB`) or in sector 0 ahead of a boot header with magic numbers at `0xF20`.
+Check every jump into the block first (`grep` the listing for target addresses inside it).
 
 ### The link manager (controller) is in flash too
 
