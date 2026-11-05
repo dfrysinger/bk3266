@@ -164,7 +164,9 @@ Full map with confidence levels: [config-map.md](skills/bk3266/references/config
 | **Turn on the firmware's debug log** (115200 8N1 on the flashing pads) | `patch --set-bits system_flag=0x1`, then `listen --port …` |
 | Replace exact code bytes (refuses if the old bytes differ) | `patch --poke 0x2bb6f=2481da:2c815a`, then `write … --allow-any-sector` |
 | Lengthen the idle timer instead | `patch --set sleep_timeout=12000` (120 s) |
-| Extract the voice prompts as WAV | `prompts dump.bin -o voice-prompts` (needs ffmpeg) |
+| Extract the voice prompts as WAV | `prompts dump.bin -o voice-prompts` (needs ffmpeg; previews at the real 8 kHz) |
+| **Replace voice prompts with soft chimes or your own speech** | `scripts/make_prompts.py out/`, then `patch --replace-prompt power-on=out/power-on.sbc …` (see [flash-format.md](skills/bk3266/references/flash-format.md)) |
+| See the LED pattern for every state | `config dump.bin` (LED table at config `+0xE9`) |
 
 ## 6. Disassembling BK3266 firmware (BA2, not ARM)
 

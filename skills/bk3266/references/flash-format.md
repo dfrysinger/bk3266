@@ -55,13 +55,31 @@ The firmware erases and rewrites the log itself when it fills, which clears them
 - Five banks of `0x7E` bytes each, selected by `wave_lang_sel`. Usually only bank 0 is populated.
 - Clip container: `total_len:u32 LE` (including those 4 bytes), followed by SBC frames. The ones seen are 40-byte frames, mono,
   32 kHz header, bitpool 16, sync bytes `9C 73 10`. `bk3266.py prompts` extracts them and decodes them with ffmpeg.
-  The headphones' actual playback rate hasn't been measured, so previews may sound fast or slow.
+- **The real playback rate is 8 kHz.** The debug log shows the prompt player initialising the DAC with `audio DAC init:8000,1,16`, and
+  previews relabelled to 8 kHz sound identical to the headset (owner-confirmed). The 32 kHz label is just a trick to get 4× more
+  audio per byte. Each 40-byte frame is 128 samples, i.e. 16 ms. `prompts` writes previews at 8 kHz.
 - Slot names: 0 power-on, 1 connected, 2 disconnected, 3 power-off, 4 pairing, 5 low-battery, 6 HFP ring,
   13 vol-max, 14 vol-min, 18–27 digits 0–9 (from the ToolKit event table at EXE file offset `0xBB924`).
 
-### Replacing a clip (not yet done on hardware)
+### Replacing a clip (done on hardware, 2026-11-04)
 
-To stay safe, encode a replacement SBC stream with the same parameters (mono, 32 kHz, bitpool 16,
-matching frame size) that **fits within the original clip's allocation**, and update its length word. Then fix the CRCs of every
-record you touch. Short beeps or silence fit easily. Relocating clips means rewriting page pointers and many sectors
-outside the config region (`--allow-any-sector`), so treat that as a code-region-risk change.
+```sh
+python3 scripts/make_prompts.py my-prompts          # soft low chimes + 8 kHz previews (edit it for your own sounds / speech)
+afplay my-prompts/power-on.wav                      # listen first
+python3 scripts/bk3266.py patch dump.bin -o new.bin \
+    --replace-prompt power-on=my-prompts/power-on.sbc --replace-prompt power-off=my-prompts/power-off.sbc
+python3 scripts/bk3266.py write new.bin --expect dump.bin --port … --allow-any-sector --max-sectors 5 --yes
+```
+
+`--replace-prompt` checks that the new stream is valid SBC with the original clip's parameters, apart from the allocation
+method: ffmpeg encodes "loudness" while the originals use "SNR", and the headset plays both. It also checks that the stream fits before
+the next clip (any bank) starts, then writes the length word and frames and fixes every CRC. The bytes after the new clip
+are left as they were. Room per slot in the 2021 "Cozy" layout, in frames of 16 ms: power-on 102, connected 63,
+disconnected 76, power-off 76, pairing 140. Prompt clips are in the audio area (`0x63000`–`0x67000` raw), so a full set touches
+about 5 sectors. Pass `--max-sectors` accordingly.
+
+The ToolKit's prompt slot order: 0 power on, 1 connected, 2 disconnected, 3 power off, 4 pairing, 5 low battery,
+6 HFP ring, 7 HFP ack, 8 HF reject, 9 HF cancel, 10 voice dial, 11 mute mic, 12 unmute mic, 13 vol max, 14 vol min,
+15 HF transfer, 16 HF redial, 17 clear memory, 18–27 digits (used only when `bt_flag` `0x80` is set).
+
+Relocating clips (growing one past its neighbour) means rewriting page pointers, so it's not supported.

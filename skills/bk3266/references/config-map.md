@@ -31,11 +31,28 @@ Confidence: **V** = verified in firmware code or by a hardware write; **T** = fr
 | `action_disconn` | `0x0A4` | u8 | 0 = wait for pairing, 1 = auto reconnect | T |
 | `wave_lang_sel` | `0x0E5` | u8 | prompt bank | T |
 | `wave_info[42]` ×5 banks | `0x424` | 3 B each | `type, page:u16`. Bank stride `0x7E` | V (mute written and verified) |
+| `led_info[28]` | `0x0E9` | 11 B each | `led u8, on_ms u16, off_ms u16, repeat u8, num_flash u8, timeout u32` (`0xFFFFFFFF` = forever). `led`: 0 LED0, 1 LED1, 2 LED_LP, 3 alternate, 4 both. Printed by `config` | V (layout from the firmware's own `led info[%d]` dump at `0x6D03`; event names inferred from the ToolKit order) |
 | `sw_features.feature_flag` | `0x34A` | u32 | **bit `0x80000` gates the sniff path in 2021 firmware** (RAM `r2+0x7C3C`, config RAM base `r2+0x78F2`) | V (code + hardware): clearing it stops the 0x22 disconnect loop |
 
 Example values from one device (a "Cozy" sleep headband, 2021 firmware): warning 3300, shutdown 3100,
 `lp_interval` 6000, `sleep_timeout` 3000 (30 s), `disconn_retry_interval` 6000, `disconn_retry_count` -1,
 `bt_flag` `0x237`, `feature_flag` `0x001810C7`.
+
+### LED events on the 2021 "Cozy" headband (LED0 = blue, LED1 = red, owner-confirmed)
+
+| Event | Pattern |
+|---|---|
+| 0 auto-connecting, 1 pairing | blue/red alternating, 200 ms / 200 ms |
+| 3 connected, 4 paused, 5 playing, 6–8 calls | blue 0.5 s on / 5 s off |
+| 9 low battery | red, 3 flashes then 4 s off |
+| 10 charging | red solid |
+| 11 battery full | blue solid |
+| 12 power on | blue 1.2 s |
+| 13 power off | red 1.2 s |
+| 20 (not in the 2018 ToolKit list) | red 1 s / 1 s |
+
+ToolKit event order: auto-connecting, match (pairing), no match no conn, connected, pause, play, incoming ringing,
+outgoing ringing, call established, low battery, charging, battery full, power on, power off, line in, test mode, FM search.
 
 ## Finding the config on other flash sizes
 

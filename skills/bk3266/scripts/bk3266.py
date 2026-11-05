@@ -105,6 +105,15 @@ FIELDS = {
 WAVE_INFO = 0x424
 WAVE_BANK_STRIDE = 0x7E
 WAVE_SLOTS = 42
+PAIRING_LOG = (0x7E000, 0x7F000)   # raw; firmware-managed, not CRC-paged, rewritten by the firmware as it runs
+PROMPT_PLAY_RATE = 8000      # real playback rate of prompt clips (frames are labelled 32 kHz)
+LED_INFO = 0xE9              # config offset of the LED event table (2021 firmware)
+LED_ENTRY = 11               # index u8, on_ms u16, off_ms u16, repeat u8, num_flash u8, timeout u32
+LED_EVENTS = 28
+LED_EVENT_NAMES = ['auto-connecting', 'pairing', 'no-pairing-no-conn', 'connected', 'paused', 'playing',
+                   'incoming-ring', 'outgoing-ring', 'in-call', 'low-battery', 'charging', 'battery-full',
+                   'power-on', 'power-off', 'line-in', 'test-mode', 'fm-search']   # ToolKit order; inferred
+LED_INDEX_NAMES = {0: 'LED0', 1: 'LED1', 2: 'LED_LP', 3: 'alternate', 4: 'both'}
 PROMPT_NAMES = {
     0: 'power-on', 1: 'connected', 2: 'disconnected', 3: 'power-off',
     4: 'pairing', 5: 'low-battery', 6: 'hfp-ring', 13: 'vol-max', 14: 'vol-min',
@@ -144,7 +153,56 @@ def decode_config(raw: bytes, base: int) -> dict:
                                        page=hex(int.from_bytes(rec[1:], 'little')), raw=hex(raw_of(start + slot * 3))))
     out['populated_banks'] = [b for b in range(5)
                               if any(read_logical(raw, base + WAVE_INFO + b * WAVE_BANK_STRIDE, 3 * WAVE_SLOTS))]
+    out['leds'] = []
+    for i in range(LED_EVENTS):
+        rec = read_logical(raw, base + LED_INFO + i * LED_ENTRY, LED_ENTRY)
+        idx, on, off, rep, nflash, timeout = struct.unpack('<BHHBBI', rec)
+        if any(rec):
+            out['leds'].append(dict(event=i, name=LED_EVENT_NAMES[i] if i < len(LED_EVENT_NAMES) else f'event-{i}',
+                                    led=LED_INDEX_NAMES.get(idx, hex(idx)), on_ms=on, off_ms=off, repeat=rep,
+                                    num_flash=nflash, timeout=timeout, raw=hex(raw_of(base + LED_INFO + i * LED_ENTRY))))
     return out
+
+
+def prompt_allocation(raw: bytes, base: int, page: int) -> int:
+    """Bytes available to the clip starting at `page`: up to the next clip used in any bank."""
+    pages = set()
+    for b in range(5):
+        start = base + WAVE_INFO + b * WAVE_BANK_STRIDE
+        for slot in range(WAVE_SLOTS):
+            rec = read_logical(raw, start + slot * 3, 3)
+            if rec[0]:
+                pages.add(int.from_bytes(rec[1:], 'little'))
+    later = sorted(p for p in pages if p > page)
+    if not later:
+        raise SystemExit(f'clip at page {page:#x} is the last one; its allocation is unknown, refusing to grow it')
+    return (later[0] - page) * 256
+
+
+def sbc_frames(data: bytes) -> tuple:
+    """Validate an SBC stream; return (frame_count, header_signature) or raise SystemExit."""
+    i = n = 0
+    sig = None
+    while i < len(data):
+        if data[i] != 0x9C or i + 4 > len(data):
+            raise SystemExit(f'not an SBC frame at byte {i}')
+        b1, bitpool = data[i + 1], data[i + 2]
+        blocks = (4, 8, 12, 16)[(b1 >> 4) & 3]
+        mode = (b1 >> 2) & 3
+        subbands = 8 if b1 & 1 else 4
+        if mode != 0:
+            raise SystemExit('prompt clips are mono; this SBC stream is not')
+        length = 4 + (4 * subbands) // 8 + -(-(blocks * bitpool) // 8)
+        this = (b1 & 0xFD, bitpool)                 # ignore the allocation-method bit (loudness vs SNR both decode)
+        if sig is None:
+            sig = this
+        elif this != sig:
+            raise SystemExit(f'SBC parameters change at frame {n}')
+        i += length
+        n += 1
+    if i != len(data):
+        raise SystemExit('SBC stream ends mid-frame')
+    return n, sig
 
 
 def patch_logical(img: bytearray, logical: int, new: bytes) -> None:
@@ -431,14 +489,39 @@ def cmd_dump(a):
                 images.append(img)
                 manifest['dumps'].append(dict(file=f'flash-dump-{n}.bin', sha256=sha(img)))
                 (ev / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+            diff = [i for i in range(size) if any(img[i] != images[0][i] for img in images[1:])]
+            lo, hi = PAIRING_LOG
+            if diff and all(lo <= i < hi for i in diff):
+                # Only the firmware-managed pairing log differs: characterise its unstable bits
+                # with extra reads instead of failing (see references/flash-format.md).
+                sector = lo // SECTOR * SECTOR
+                reads = [img[sector:sector + SECTOR] for img in images]
+                reads += [link.read(sector) for _ in range(a.rereads)]
+                unstable = []
+                for off in range(SECTOR):
+                    vals = sorted({r[off] for r in reads})
+                    if len(vals) > 1:
+                        unstable.append(dict(raw=hex(sector + off),
+                                             values={f'{v:02x}': sum(r[off] == v for r in reads) for v in vals}))
+                manifest['unstable_pairing_log_bytes'] = unstable
             ok = True
         finally:
             finish(link, a, ok)
     manifest['identical'] = len({sha(i) for i in images}) == 1
+    usable = manifest['identical'] or 'unstable_pairing_log_bytes' in manifest
+    manifest['usable_baseline'] = usable
     (ev / 'manifest.json').write_text(json.dumps(manifest, indent=2))
-    say(a.say, 'Backup complete.' if manifest['identical'] else 'Backups differ. Do not write.')
     print(json.dumps(manifest, indent=2))
-    if not manifest['identical']:
+    if manifest['identical']:
+        print('>>> Backup complete.', flush=True)
+    elif usable:
+        n = len(manifest['unstable_pairing_log_bytes'])
+        print(f'>>> Backup complete. The passes match except {n} unstable byte(s) in the firmware-managed pairing log '
+              f'({PAIRING_LOG[0]:#x}-{PAIRING_LOG[1]:#x}). flash-dump-1.bin is a usable baseline for writes elsewhere; '
+              f'pass `write --ignore-range {PAIRING_LOG[0]:#x}-{PAIRING_LOG[1]:#x}`.', flush=True)
+    else:
+        print('>>> Backups differ outside the pairing log. Do not write; check wiring and power, then dump again.',
+              flush=True)
         sys.exit(2)
 
 
@@ -584,7 +667,7 @@ def cmd_write(a):
             if not same_outside(after, candidate, ignored, 'post-image', manifest):
                 raise IOError('post-write full image != candidate')
             state('WRITTEN_AND_VERIFIED', after_sha256=sha(after), final_sr=link.status().hex(' '))
-            say(a.say, 'Write verified.')
+            print('>>> Write verified.', flush=True)
             ok = True
         except BaseException as exc:
             state('FAILED', error=repr(exc))
@@ -678,6 +761,11 @@ def cmd_config(a):
     print(f'prompt banks populated: {cfg["populated_banks"]}')
     for p in cfg['prompts']:
         print(f'  slot {p["slot"]:2} {p["name"]:14} type {p["type"]} page {p["page"]}  raw {p["raw"]}')
+    print('LED events (names inferred from the 2018 ToolKit order; ms; LED0/LED1 colours are board-specific):')
+    for e in cfg['leds']:
+        t = 'forever' if e['timeout'] == 0xFFFFFFFF else e['timeout']
+        print(f'  {e["event"]:2} {e["name"]:18} {e["led"]:9} on {e["on_ms"]:5} off {e["off_ms"]:5} '
+              f'flash {e["num_flash"]} repeat {e["repeat"]} timeout {t}  raw {e["raw"]}')
 
 
 def cmd_patch(a):
@@ -710,6 +798,27 @@ def cmd_patch(a):
         old = read_logical(img, at, 1)[0]
         patch_logical(img, at, b'\x00')
         print(f'prompt slot {slot} ({PROMPT_NAMES.get(slot, "?")}): type {old} -> 0 (unused)')
+    for item in a.replace_prompt or []:
+        slot_name, path = item.split('=', 1)
+        slot = PROMPT_SLOTS[slot_name] if slot_name in PROMPT_SLOTS else parse_int(slot_name)
+        rec = read_logical(img, base + WAVE_INFO + bank * WAVE_BANK_STRIDE + slot * 3, 3)
+        if not rec[0]:
+            raise SystemExit(f'prompt slot {slot} is unused in bank {bank}; nothing to replace')
+        page = int.from_bytes(rec[1:], 'little')
+        at = page * 256
+        old_size = int.from_bytes(read_logical(img, at, 4), 'little')
+        old_frames, old_sig = sbc_frames(read_logical(img, at + 4, old_size - 4))
+        new = Path(path).read_bytes()
+        frames, sig = sbc_frames(new)
+        if sig != old_sig:
+            raise SystemExit(f'{path}: SBC parameters {sig} differ from the original clip {old_sig} '
+                             '(need mono, same blocks/subbands/bitpool/sample-rate label)')
+        room = prompt_allocation(img, base, page)
+        if len(new) + 4 > room:
+            raise SystemExit(f'{path}: {len(new) + 4} bytes but slot {slot} has {room} before the next clip')
+        patch_logical(img, at, struct.pack('<I', len(new) + 4) + new)
+        print(f'prompt slot {slot} ({PROMPT_NAMES.get(slot, "?")}): {old_frames} -> {frames} frames '
+              f'({(frames * 128) / PROMPT_PLAY_RATE:.2f} s at {PROMPT_PLAY_RATE} Hz), {len(new) + 4}/{room} bytes')
     for item in a.poke or []:
         addr, spec = item.split('=', 1)
         old_hex, new_hex = spec.split(':', 1)
@@ -749,8 +858,11 @@ def cmd_prompts(a):
         (out / f'{name}.sbc').write_bytes(sbc)
         if not a.no_wav:
             try:
+                # Frames say 32 kHz but the prompt player runs the DAC at 8 kHz (debug log:
+                # "audio DAC init:8000,1,16"), so relabel to hear the real speed and pitch.
                 subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'sbc', '-i',
-                                str(out / f'{name}.sbc'), '-y', str(out / f'{name}.wav')], check=True)
+                                str(out / f'{name}.sbc'), '-af', f'asetrate={PROMPT_PLAY_RATE}', '-ar', '16000',
+                                '-y', str(out / f'{name}.wav')], check=True)
             except (FileNotFoundError, subprocess.CalledProcessError) as e:
                 print(f'ffmpeg decode failed for {name}: {e}')
         rows.append(dict(slot=p['slot'], name=p['name'], logical=hex(addr), container_bytes=size, sbc_bytes=len(sbc)))
@@ -965,6 +1077,8 @@ def main(argv=None):
     device(p)
     p.add_argument('--out', type=Path, default=Path('bk3266-evidence'))
     p.add_argument('--passes', type=int, default=2)
+    p.add_argument('--rereads', type=int, default=6,
+                   help='extra reads of the pairing-log sector to characterise unstable bits when only it differs')
     p.set_defaults(fn=cmd_dump)
 
     p = sub.add_parser('write', help='write changed sectors of a candidate image (dry run without --yes)')
@@ -1003,6 +1117,9 @@ def main(argv=None):
     p.add_argument('--clear-bits', action='append', metavar='FIELD=MASK')
     p.add_argument('--set-bits', action='append', metavar='FIELD=MASK')
     p.add_argument('--mute-prompt', action='append', metavar='NAME|SLOT', help=f'one of {sorted(PROMPT_SLOTS)}')
+    p.add_argument('--replace-prompt', action='append', metavar='NAME|SLOT=FILE.sbc',
+                   help='replace a voice prompt with an SBC file in the same format (mono, 16 blocks, 8 subbands, '
+                        'same bitpool, labelled 32 kHz; played at 8 kHz). Must fit before the next clip')
     p.add_argument('--poke', action='append', metavar='LOGICAL=OLDHEX:NEWHEX',
                    help='replace bytes at a logical (CRC-stripped) address; refuses unless the old bytes match. '
                         'For code patches: write needs --allow-any-sector outside the config region')

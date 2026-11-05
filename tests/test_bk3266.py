@@ -145,6 +145,25 @@ class FakeRunningFirmware(FakeBootloader):
         return super().write(data)
 
 
+class FakeFlakyBit(FakeBootloader):
+    """One weakly-programmed bit that reads differently on alternate reads of its sector."""
+
+    def __init__(self, flash, flaky_at):
+        super().__init__(flash)
+        self.flaky_at = flaky_at
+        self.reads_of_sector = 0
+
+    def handle(self, cmd, args):
+        if cmd == bk.CMD_READ and int.from_bytes(args[:4], 'little') == self.flaky_at // 4096 * 4096:
+            self.reads_of_sector += 1
+            if self.reads_of_sector % 2 == 0:
+                self.flash[self.flaky_at] ^= 0x04
+                super().handle(cmd, args)
+                self.flash[self.flaky_at] ^= 0x04
+                return
+        super().handle(cmd, args)
+
+
 def run(argv):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -203,6 +222,32 @@ class PatchTests(unittest.TestCase):
         diff = [i for i in range(len(a)) if a[i] != b[i]]
         self.assertTrue(all(i // 34 == 0x1000 // 32 for i in diff), 'only that record changes')
 
+    def test_replace_prompt_fits_and_refuses_overflow(self):
+        logical = bytearray(bk.strip(synthetic_image()))
+        frame = lambda hdr: bytes([0x9C, hdr, 0x10]) + bytes(37)          # 40-byte mono SBC frame, bitpool 16
+        for slot, page in ((0, 0x10), (1, 0x14)):                           # slot 0 has 4 pages before slot 1
+            logical[CFG + 0x424 + slot * 3:CFG + 0x427 + slot * 3] = bytes([2]) + page.to_bytes(2, 'little')
+        logical[0x1000:0x1004] = (4 + 40).to_bytes(4, 'little')
+        logical[0x1004:0x102C] = frame(0x73)                               # original clip: SNR allocation
+        raw = bytearray(b'\xff' * SIZE)
+        for i in range(0, len(logical), 32):
+            raw[i // 32 * 34:i // 32 * 34 + 32] = logical[i:i + 32]
+            raw[i // 32 * 34 + 32:i // 32 * 34 + 34] = bk.crc16(bytes(logical[i:i + 32])).to_bytes(2, 'big')
+        self.src.write_bytes(raw)
+        ok = self.tmp / 'ok.sbc'
+        ok.write_bytes(frame(0x71) * 3)                                     # loudness allocation is accepted
+        _, b = self.patch('--replace-prompt', f'power-on={ok}')
+        self.assertEqual(bk.strip(b)[0x1000:0x1004], (4 + 120).to_bytes(4, 'little'))
+        self.assertEqual(bk.strip(b)[0x1004:0x107C], frame(0x71) * 3)
+        big = self.tmp / 'big.sbc'
+        big.write_bytes(frame(0x71) * 30)                                   # 1204 bytes > 1024 available
+        with self.assertRaises(SystemExit):
+            self.patch('--replace-prompt', f'power-on={big}')
+        stereo = self.tmp / 'stereo.sbc'
+        stereo.write_bytes(bytes([0x9C, 0x7D, 0x10]) + bytes(37))
+        with self.assertRaises(SystemExit):
+            self.patch('--replace-prompt', f'power-on={stereo}')
+
     def test_poke_refuses_when_old_bytes_differ(self):
         logical = bk.strip(synthetic_image())
         wrong = bytes(b ^ 1 for b in logical[0x1000:0x1002])
@@ -230,6 +275,24 @@ class DeviceTests(unittest.TestCase):
         cand = self.tmp / 'cand.bin'
         run(['patch', str(src), '-o', str(cand), '--config-base', hex(CFG), '--mute-prompt', 'low-battery'])
         return src, cand
+
+    def test_dump_accepts_unstable_bits_only_in_pairing_log(self):
+        saved = bk.PAIRING_LOG
+        bk.PAIRING_LOG = (0xE000, 0xF000)            # inside the 64 KiB synthetic flash
+        try:
+            self.fake = FakeFlakyBit(self.orig, 0xE013)
+            out = run(['dump', '--port', 'fake', '--wait', '2', '--out', str(self.tmp)])
+            self.assertIn('"usable_baseline": true', out)
+            self.assertIn('0xe013', out)
+            self.assertIn('--ignore-range 0xe000-0xf000', out)
+        finally:
+            bk.PAIRING_LOG = saved
+
+    def test_dump_still_fails_on_differences_elsewhere(self):
+        self.fake = FakeFlakyBit(self.orig, 0x2013)
+        with self.assertRaises(SystemExit) as cm:
+            run(['dump', '--port', 'fake', '--wait', '2', '--out', str(self.tmp)])
+        self.assertEqual(cm.exception.code, 2)
 
     def test_connect_waits_out_running_firmware(self):
         self.fake = FakeRunningFirmware(self.orig)
