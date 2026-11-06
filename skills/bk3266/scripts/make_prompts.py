@@ -24,7 +24,8 @@ from pathlib import Path
 
 RATE = 8000
 FRAME_SAMPLES = 128
-BUDGET = {'power-on': 102, 'power-off': 76, 'connected': 63, 'disconnected': 76, 'pairing': 140}
+BUDGET = {'power-on': 102, 'power-off': 76, 'connected': 63, 'disconnected': 76, 'pairing': 140,
+          'hfp-ring': 268, 'call-reject': 83, 'vol-max': 38, 'redial': 16}   # vol-max's clip is shared with vol-min
 
 
 def tone_seq(notes, note_s=0.17, partials=(1.0, 0.45, 0.15)):
@@ -43,13 +44,36 @@ def tone_seq(notes, note_s=0.17, partials=(1.0, 0.45, 0.15)):
     return buf
 
 
+def load_audio(path, tempo=1.0, pitch=1.0, compress=False):
+    """Any audio file (e.g. a voiceover MP3) as 8 kHz mono floats. `tempo` > 1 speeds speech up without
+    changing pitch, to squeeze a phrase into a short slot; `pitch` < 1 lowers the voice (0.89 ≈ 2 semitones)
+    without changing speed. `compress` evens out loud syllables, which otherwise distort through the low-bitpool
+    SBC codec and the tiny driver. The 150 Hz high-pass keeps tiny drivers clean."""
+    af = ['aresample=44100', 'highpass=f=150']   # fixed working rate so the pitch math holds for any input
+    # Trim lead/tail silence first: compression would lift the breath/room tail and waste the slot on it.
+    trim_edges = 'silenceremove=start_periods=1:start_threshold=-45dB'
+    af += [trim_edges, 'areverse', trim_edges, 'areverse']
+    if pitch != 1.0:                     # resample-shift the pitch, then restore the duration
+        af += [f'asetrate=44100*{pitch}', 'aresample=44100', f'atempo={1 / pitch:.4f}']
+    if tempo != 1.0:
+        af.append(f'atempo={tempo}')
+    if compress:
+        af.append('acompressor=threshold=0.1:ratio=4:attack=5:release=80:makeup=2')
+    af.append('lowpass=f=3400')          # nothing above ~3.5 kHz survives 8 kHz playback anyway
+    af = ','.join(af)
+    raw = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', str(path), '-ac', '1', '-ar', str(RATE),
+                          '-af', af, '-f', 's16le', '-'], check=True, capture_output=True).stdout
+    return [v / 32768 for v in struct.unpack(f'<{len(raw) // 2}h', raw)]
+
+
 def speech(text, out, voice='Samantha', rate=175):
+    """Speech from macOS `say` (free, robotic). For better voices, load a recorded or generated file with
+    load_audio()."""
     aiff = out / 'tmp-say.aiff'
     subprocess.run(['say', '-v', voice, '-r', str(rate), '-o', str(aiff), text], check=True)
-    raw = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', str(aiff), '-ac', '1', '-ar', str(RATE),
-                          '-af', 'highpass=f=150', '-f', 's16le', '-'], check=True, capture_output=True).stdout
+    buf = load_audio(aiff)
     aiff.unlink()
-    return [v / 32768 for v in struct.unpack(f'<{len(raw) // 2}h', raw)]
+    return buf
 
 
 def echo(buf, delay=0.11, feedback=0.38, taps=5, tail=0.6):
@@ -84,14 +108,15 @@ def fit(buf, frames, fade_s=0.15):
     return buf
 
 
-def render(out, name, buf, wet=True):
+def render(out, name, buf, wet=True, level=0.89):
+    """`level` is the peak (0.89 = -1 dBFS, right for chimes; speech sounds cleaner around 0.5 = -6 dBFS)."""
     budget = BUDGET[name]
     buf = trim(buf)
     if wet:
         buf = trim(echo(buf), thresh=0.004)
     buf = fit(buf, budget)
     peak = max(abs(v) for v in buf) or 1
-    buf = [v / peak * 0.89 for v in buf]                        # -1 dBFS
+    buf = [v / peak * level for v in buf]
     frames = math.ceil(len(buf) / FRAME_SAMPLES)
     buf += [0.0] * (frames * FRAME_SAMPLES - len(buf))
     pcm = struct.pack(f'<{len(buf)}h', *(int(v * 32767) for v in buf))
@@ -119,6 +144,16 @@ def main():
     render(out, 'connected', tone_seq([G3, D4], note_s=0.22))
     render(out, 'disconnected', tone_seq([D4, G3], note_s=0.22))
     render(out, 'pairing', tone_seq([D4, 0, 0, D4], note_s=0.22))
+    # Calls and controls, same family. The ring is a soft fast trill (what makes it read as "phone")
+    # in a ring-ring … ring-ring cadence; call reject is a flat "nuh-uh"; volume and redial are single taps.
+    def trill(seconds, a=D4, b=G4, step=0.05):
+        return [a if i % 2 == 0 else b for i in range(int(seconds / step))]
+    rest = lambda seconds: [0] * int(seconds / 0.05)
+    ring = trill(0.4) + rest(0.2) + trill(0.4) + rest(0.9) + trill(0.4) + rest(0.2) + trill(0.4)
+    render(out, 'hfp-ring', tone_seq(ring, note_s=0.05, partials=(1.0, 0.4, 0.12)), wet=False)
+    render(out, 'call-reject', tone_seq([G3, G3], note_s=0.2))
+    render(out, 'vol-max', tone_seq([D4], note_s=0.15))
+    render(out, 'redial', tone_seq([B3], note_s=0.12), wet=False)
     # Speech instead, e.g.: render(out, 'power-on', speech('Powering on', out), wet=False)
 
 

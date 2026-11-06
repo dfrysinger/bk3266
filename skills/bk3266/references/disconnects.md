@@ -99,8 +99,23 @@ because the window's LO covers it. The link-maximum clamp just before it is unch
 Short sniff periods early in a run end at the radio layer, with no command from either host, so they aren't firmware-driven.
 For an accepted request, B+C and A+B execute identical code.
 
-Not yet exercised: the 4-round give-up path (an iPhone never counter-proposes back), Android phones, battery comparison
+Not yet exercised: the 4-round give-up path (an iPhone never counter-proposes back), battery comparison
 against the config-only fix, and multi-night use.
+
+**Android (Pixel 5, Android 14, A+B build, 2026-11-06): stable, no idle drops in ~35 min.** `bk3266.py pklg` reads Android's
+`btsnoop_hci.log` too (Developer options → Enable Bluetooth HCI snoop log → Enabled, restart Bluetooth, then
+`adb bugreport` and take `FS/data/misc/bluetooth/logs/btsnoop_hci.log` from the zip).
+- Android asks for sniff 250–500 ms, attempt 4, timeout 1, repeatedly (every 10–60 s) and doesn't give up after a refusal.
+  Before the headset's own idle `sniff enable` it gets `0x24` (fine); after it, the patched headset accepts at **400 ms**.
+  Headset-initiated 320 ms sniff is also accepted. Both directions held for minutes.
+- With the iPhone and the Pixel both connected, both links reach sniff (`sniff enable:0` / `enter sniff:1`, then `enter sniff:0`).
+- **Seen once, not reproduced:** after a boot where the iPhone auto-connected and the Pixel was then *paired for the first time*,
+  the Pixel's link spent 17 min refusing every sniff (`0x24`) while the headset logged only `enter sniff:1,0033` every 30 s,
+  never `sniff enable`. The idle routine (`0x2FFxx`, calling the policy setter `0x2654C`) skips the enable when its per-link
+  "policy on" byte is already set, so that byte said "on" while the controller's link policy was off. No drops, just no
+  power saving. A headset power cycle cleared it. Suspect: a stale per-link flag on the first-pairing path.
+- When a second phone connects, the headset drops the first one (headset log: reason `0x16`; phone: `0x13`) and
+  reconnects it within about 1 s. That's a multipoint quirk, not the sniff bug.
 
 ### Root cause, from the headset's own log (2026-11-04)
 

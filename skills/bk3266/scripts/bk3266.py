@@ -116,7 +116,9 @@ LED_EVENT_NAMES = ['auto-connecting', 'pairing', 'no-pairing-no-conn', 'connecte
 LED_INDEX_NAMES = {0: 'LED0', 1: 'LED1', 2: 'LED_LP', 3: 'alternate', 4: 'both'}
 PROMPT_NAMES = {
     0: 'power-on', 1: 'connected', 2: 'disconnected', 3: 'power-off',
-    4: 'pairing', 5: 'low-battery', 6: 'hfp-ring', 13: 'vol-max', 14: 'vol-min',
+    4: 'pairing', 5: 'low-battery', 6: 'hfp-ring', 7: 'hfp-ack', 8: 'call-reject', 9: 'call-cancel',
+    10: 'voice-dial', 11: 'mic-mute', 12: 'mic-unmute', 13: 'vol-max', 14: 'vol-min', 15: 'call-transfer',
+    16: 'redial', 17: 'clear-memory',          # 7-17 from the ToolKit's prompt event order
     **{18 + n: f'number-{n}' for n in range(10)},
 }
 PROMPT_SLOTS = {v: k for k, v in PROMPT_NAMES.items()}
@@ -813,7 +815,11 @@ def cmd_patch(a):
         if sig != old_sig:
             raise SystemExit(f'{path}: SBC parameters {sig} differ from the original clip {old_sig} '
                              '(need mono, same blocks/subbands/bitpool/sample-rate label)')
-        room = prompt_allocation(img, base, page)
+        try:
+            room = prompt_allocation(img, base, page)
+        except SystemExit:
+            room = old_size                       # last clip in flash: allow anything no bigger than it is now
+            print(f'prompt slot {slot} is the last clip; limiting the replacement to its current {old_size} bytes')
         if len(new) + 4 > room:
             raise SystemExit(f'{path}: {len(new) + 4} bytes but slot {slot} has {room} before the next clip')
         patch_logical(img, at, struct.pack('<I', len(new) + 4) + new)
@@ -936,6 +942,25 @@ def pklg_records(blob: bytes):
         pos += 4 + length
 
 
+BTSNOOP_EPOCH_US = 0x00DCDDB30F2F8000   # btsnoop timestamps count microseconds from year 0; this is 1970-01-01
+
+
+def btsnoop_records(blob: bytes):
+    """Android's HCI snoop log (btsnoop_hci.log, H4 datalink 1002), yielded in the same shape as pklg_records:
+    kind 0x00 = HCI command, 0x01 = HCI event (ACL/SCO records are skipped)."""
+    pos = 16                                # 'btsnoop\0' + version + datalink
+    while pos + 24 <= len(blob):
+        incl = int.from_bytes(blob[pos + 4:pos + 8], 'big')
+        ts = int.from_bytes(blob[pos + 16:pos + 24], 'big')
+        data = blob[pos + 24:pos + 24 + incl]
+        pos += 24 + incl
+        if len(data) < 2:
+            continue
+        kind = {0x01: 0x00, 0x04: 0x01}.get(data[0])   # H4 packet type
+        if kind is not None:
+            yield (ts - BTSNOOP_EPOCH_US) / 1e6, kind, data[1:]
+
+
 def cmd_pklg(a):
     """Phone captures contain every device the phone talks to (watch, earbuds, car...). Use the summary at the
     end to identify the headset (BK3266 parts report LMP 0x09 / manufacturer 0x000e; Apple devices 0x004c),
@@ -961,7 +986,8 @@ def cmd_pklg(a):
         elif (addr is not None and addr == want_addr) or (h is not None and h in want):
             print(line)
 
-    for t, kind, data in pklg_records(blob):
+    records = btsnoop_records(blob) if blob.startswith(b'btsnoop\x00') else pklg_records(blob)
+    for t, kind, data in records:
         count += 1
         stamp = time.strftime('%H:%M:%S', time.localtime(t)) + f'.{int(t % 1 * 1000):03d}'
         if kind == 0x00 and len(data) >= 3:  # HCI command
@@ -1148,7 +1174,7 @@ def main(argv=None):
     p.add_argument('--pyba2', help='path to an existing pyba2 checkout')
     p.set_defaults(fn=cmd_disasm)
 
-    p = sub.add_parser('pklg', help='summarize sniff/disconnect events in an Apple PacketLogger capture')
+    p = sub.add_parser('pklg', help='summarize sniff/disconnect events in an iPhone PacketLogger (.pklg) or Android btsnoop_hci.log capture')
     p.add_argument('capture')
     p.add_argument('--device', metavar='ADDR', help='only show events for this Bluetooth address (aa:bb:cc:dd:ee:ff)')
     p.add_argument('--handle', action='append', default=[],
